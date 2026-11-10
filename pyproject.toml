@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hypertier"
+dynamic = ["version"]
+description = "Tiered-memory inference runtime: run huge AI models on small GPUs (early development)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Valentin Fernandez" }]
+keywords = [
+  "llm", "inference", "vram", "offloading", "mixture-of-experts",
+  "diffusion", "kv-cache", "quantization", "triton", "pytorch",
+]
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Runtime dependencies (torch, triton, safetensors) will be added with the
+# first functional release; the placeholder installs nothing heavy.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/vfernandezg-dev/HyperTier"
+Repository = "https://github.com/vfernandezg-dev/HyperTier"
+Issues = "https://github.com/vfernandezg-dev/HyperTier/issues"
+
+[tool.hatch.version]
+path = "src/hypertier/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hypertier"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
