@@ -75,7 +75,11 @@ python -m pip install -e ".[dev]"
 
 # ---------------------------------------------------------------------------
 step "5/6  Verifying CUDA, pinned memory and a Triton kernel on the GPU"
-python - <<'PY'
+# Triton's @jit reads the kernel source with inspect.getsourcelines(), which fails for code
+# piped through stdin; run the check from a real file in a private temp dir instead.
+CHECK_DIR="$(mktemp -d)"
+trap 'rm -rf -- "$CHECK_DIR"' EXIT
+cat > "$CHECK_DIR/check_gpu.py" <<'PY'
 import sys
 import torch
 
@@ -116,6 +120,7 @@ torch.cuda.synchronize()
 assert torch.allclose(out, x + y), "Triton kernel produced wrong results"
 print("Triton  vector-add kernel ran on the GPU and matches PyTorch  ✔")
 PY
+python "$CHECK_DIR/check_gpu.py"
 
 # ---------------------------------------------------------------------------
 step "6/6  Running the test suite"
