@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-authors = [{ name = "Valentin Fernandez" }]
+authors = [{ name = "Valentin Fernandez", email = "me@vfernandezg.dev" }]
 keywords = [
   "llm", "inference", "vram", "offloading", "mixture-of-experts",
   "diffusion", "kv-cache", "quantization", "triton", "pytorch",

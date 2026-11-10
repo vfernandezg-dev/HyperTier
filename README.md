@@ -83,6 +83,10 @@ pytest
 
 Contributions, ideas and benchmarks on low-VRAM hardware are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Security
+
+Please report vulnerabilities privately — see [SECURITY.md](SECURITY.md). Do not open public issues for security problems.
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
