@@ -48,6 +48,7 @@ packages = ["src/hypertier"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["cuda: needs a CUDA GPU; skipped automatically when none is available"]
 
 [tool.ruff]
 line-length = 100

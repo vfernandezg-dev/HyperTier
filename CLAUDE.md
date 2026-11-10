@@ -30,6 +30,7 @@ source .venv/bin/activate
 
 pytest -q                       # tests
 TRITON_INTERPRET=1 pytest -q    # run Triton kernels on CPU (no GPU needed)
+python benchmarks/bench_hw.py   # hardware profile -> benchmarks/results/hw_*.json (--quick: smoke)
 ruff check .                    # lint (line length 100, target py310)
 python -m build                 # build sdist + wheel
 ```
