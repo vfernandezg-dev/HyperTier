@@ -7,6 +7,7 @@ Pure logic (statistics, file I/O, the pinned-probe algorithm) runs everywhere, i
 without PyTorch. Tests marked ``cuda`` run the real probes at tiny sizes on a GPU.
 """
 
+import ctypes
 import math
 import os
 import sys
@@ -166,6 +167,24 @@ def test_default_ram_reserve():
 
 
 # --- file I/O and the NVMe probe (small files, no GPU) ------------------------------------
+
+
+@pytest.mark.cuda
+def test_pinned_aligned_buffer_is_aligned_whatever_was_pinned_before():
+    import torch
+
+    bw.release_pinned_cache()
+    # PyTorch packs small pinned requests into one segment in steps of 512 bytes.
+    tiny = torch.empty(8, dtype=torch.uint8, pin_memory=True)
+    bare = torch.empty(MiB, dtype=torch.uint8, pin_memory=True)
+    assert bare.data_ptr() % bw.DIRECT_IO_ALIGN, "the premise: a pinned tensor may be unaligned"
+    with bw.AlignedBuffer(MiB, pinned=True) as buf:
+        address = ctypes.addressof(ctypes.c_char.from_buffer(buf.view))
+        assert address % bw.DIRECT_IO_ALIGN == 0 and len(buf.view) == MiB
+        buf.view[:4] = b"abcd"
+        assert bytes(buf.view[:4]) == b"abcd"
+    del tiny, bare
+    bw.release_pinned_cache()
 
 
 def test_aligned_buffer_requires_page_multiple():

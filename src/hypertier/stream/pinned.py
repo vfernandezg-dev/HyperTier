@@ -55,6 +55,10 @@ class _Segment:
     unpin: Callable[[], None] | None  # unlocks the pages; None when PyTorch owns them
     used: int = 0
 
+    def aligned(self, align: int) -> int:
+        """Offset of the first free byte whose address is a multiple of ``align``."""
+        return self.used + -(self.tensor.data_ptr() + self.used) % align
+
 
 class PinnedPool:
     """Page-locked RAM handed out in aligned, contiguous pieces and reused after a reset.
@@ -123,16 +127,18 @@ class PinnedPool:
             raise ValueError(f"align must be a multiple of {ALIGN} that divides the page size")
         size = align_up(nbytes)
         for seg in self._segments:
-            start = align_up(seg.used, align)
+            start = seg.aligned(align)
             if seg.size - start >= size:
                 break
         else:
             if size == 0:
                 return self._torch.empty(0, dtype=self._torch.uint8)
             seg = self._grow(max(self.segment_bytes, size))
-            start = 0
-        if seg.tensor.data_ptr() % align:  # only PyTorch's own allocator could do this
-            raise RuntimeError(f"pinned segment is not {align}-byte aligned")
+            start = seg.aligned(align)
+            if seg.size - start < size:
+                # Only on the fallback: PyTorch's pinned memory may start off a page.
+                seg = self._grow(max(self.segment_bytes, size + align))
+                start = seg.aligned(align)
         view = seg.tensor[start : start + nbytes]
         seg.used = start + size
         return view
@@ -211,7 +217,9 @@ def _pin(torch: Any, nbytes: int) -> tuple[Any, Callable[[], None] | None]:
 
     If registering fails for any reason (a PyTorch without the binding, a platform that
     refuses it), a warning says so and PyTorch's pinned allocator is used instead: correct,
-    but it rounds the size up to a power of two. ``unpin`` is then None.
+    but it rounds the size up to a power of two, and it packs small requests into a shared
+    segment in steps of 512 bytes, so that memory may not start on a page. ``unpin`` is then
+    None.
     """
     try:
         cudart = torch.cuda.cudart()
