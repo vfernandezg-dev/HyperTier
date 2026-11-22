@@ -565,6 +565,23 @@ def torch_dtype(torch: Any, name: str) -> Any:
     return getattr(torch, names[name])
 
 
+def read_tensor(torch: Any, entry: TensorEntry) -> Any:
+    """The tensor of ``entry`` as an ordinary CPU tensor, read through the page cache.
+
+    For what is small and read once (buffers, the few weights kept resident): the streamed
+    blocks never come this way.
+    """
+    with open(entry.path, "rb") as f:
+        f.seek(entry.offset)
+        data = bytearray(f.read(entry.nbytes))
+    if len(data) != entry.nbytes:
+        raise EOFError(f"{entry.path}: tensor {entry.name!r} ends past the end of the file")
+    dtype = torch_dtype(torch, entry.dtype)
+    if not data:
+        return torch.empty(entry.shape, dtype=dtype)
+    return torch.frombuffer(data, dtype=dtype).view(entry.shape).clone()
+
+
 class FileBackend:
     """Runtime of a :class:`FileWeights`: pinned regions, staging buffers and the reader.
 
@@ -669,16 +686,7 @@ class FileBackend:
     def read_buffer(self, name: str) -> Any | None:
         """A persistent buffer of the checkpoint as a CPU tensor, or None if it has none."""
         entry = self._index.get(name)
-        if entry is None:
-            return None
-        with open(entry.path, "rb") as f:
-            f.seek(entry.offset)
-            data = bytearray(f.read(entry.nbytes))
-        torch = self._torch
-        dtype = torch_dtype(torch, entry.dtype)
-        if not data:
-            return torch.empty(entry.shape, dtype=dtype)
-        return torch.frombuffer(data, dtype=dtype).view(entry.shape).clone()
+        return None if entry is None else read_tensor(self._torch, entry)
 
     def _fill(
         self, block: int, target: memoryview, between: Callable[[], None] | None = None
@@ -702,4 +710,6 @@ class FileBackend:
         return memoryview(raw).cast("B")
 
 
-__all__ = ["BlockPlan", "FileBackend", "FileWeights", "Permit", "Reader", "plan_tiers"]
+__all__ = [
+    "BlockPlan", "FileBackend", "FileWeights", "Permit", "Reader", "plan_tiers", "read_tensor",
+]  # fmt: skip

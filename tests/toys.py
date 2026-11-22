@@ -150,3 +150,32 @@ def checkpoint_tensors(model) -> dict:
         name: (SAFETENSORS_DTYPES[str(value.dtype)], tuple(value.shape), tensor_bytes(value))
         for name, value in sorted(model.state_dict().items())
     }
+
+
+def tiny_causal_lm(directory, family="qwen3", *, tied=False, dtype="bfloat16", seed=0):
+    """Write a random tiny language model as a normal ``transformers`` checkpoint.
+
+    Five layers of width 64 and a vocabulary of 1500, so the output projection is larger than
+    a layer and has to be split. Returns ``directory``.
+    """
+    import torch
+    import transformers
+
+    common = {"vocab_size": 1500, "tie_word_embeddings": tied, "bos_token_id": 1,
+              "eos_token_id": 2, "pad_token_id": 0}  # fmt: skip
+    if family == "gpt2":
+        config = transformers.GPT2Config(n_embd=64, n_layer=5, n_head=4, n_positions=128, **common)
+    else:
+        cls = {"qwen3": transformers.Qwen3Config, "llama": transformers.LlamaConfig}[family]
+        extra = {"head_dim": 16} if family == "qwen3" else {}
+        config = cls(
+            hidden_size=64, intermediate_size=128, num_hidden_layers=5, num_attention_heads=4,
+            num_key_value_heads=2, max_position_embeddings=128, **extra, **common,
+        )  # fmt: skip
+    torch.manual_seed(seed)
+    model = transformers.AutoModelForCausalLM.from_config(config)
+    with torch.no_grad():
+        for param in model.parameters():  # larger than the default init: logits far from ties
+            param.mul_(4.0)
+    model.to(getattr(torch, dtype)).save_pretrained(directory)
+    return directory
