@@ -52,6 +52,8 @@ NVSMI_FIELDS = (
     "power.limit",
     "memory.total",
     "memory.used",
+    "display_active",
+    "pci.bus_id",
 )
 
 
@@ -170,6 +172,52 @@ def nvidia_smi(fields: Sequence[str] = NVSMI_FIELDS, index: int = 0) -> dict[str
     return found or None
 
 
+def _sysfs_pci_address(bus_id: str) -> str | None:
+    """nvidia-smi's ``00000000:01:00.0`` -> sysfs ``0000:01:00.0``."""
+    domain, sep, rest = bus_id.strip().partition(":")
+    try:
+        return f"{int(domain, 16):04x}:{rest.lower()}" if sep and rest else None
+    except ValueError:
+        return None
+
+
+def display_info(bus_id: str | None, sysfs: Path = Path("/sys")) -> dict[str, Any] | None:
+    """Whether the benchmarked GPU also drives the desktop, from Linux sysfs.
+
+    nvidia-smi's ``display_active`` alone cannot tell a hybrid laptop (desktop on the iGPU,
+    maybe an external monitor on the dGPU) from MUX "discrete" mode, where the dGPU renders the
+    whole desktop and loses VRAM and time to it. ``boot_vga`` marks the primary GPU and changes
+    with the MUX setting, so a run taken in the wrong mode is visible in its results.
+    Returns None where sysfs has no PCI view (e.g. WSL2).
+    """
+    address = _sysfs_pci_address(bus_id) if bus_id else None
+    if address is None:
+        return None
+    device = sysfs / "bus" / "pci" / "devices" / address
+    if not device.is_dir():
+        return None
+    try:
+        boot_vga: bool | None = (device / "boot_vga").read_text().strip() == "1"
+    except OSError:
+        boot_vga = None
+    outputs = []
+    for card in sorted((sysfs / "class" / "drm").glob("card*")):
+        if "-" in card.name:
+            continue
+        try:
+            if (card / "device").resolve().name != address:
+                continue
+        except OSError:
+            continue
+        for connector in sorted(card.parent.glob(card.name + "-*")):
+            try:
+                if (connector / "status").read_text().strip() == "connected":
+                    outputs.append(connector.name.split("-", 1)[1])
+            except OSError:
+                pass
+    return {"boot_vga": boot_vga, "connected_outputs": outputs}
+
+
 def _git_info() -> dict[str, Any] | None:
     commit = _run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"])
     if commit is None:
@@ -252,13 +300,15 @@ def collect_metadata() -> dict[str, Any]:
         index = torch.cuda.current_device()
         props = torch.cuda.get_device_properties(index)
         free, total = torch.cuda.mem_get_info(index)
+        smi = nvidia_smi(index=index)
         meta["gpu"] = {
             "name": props.name,
             "capability": f"sm_{props.major}{props.minor}",
             "multiprocessors": props.multi_processor_count,
             "total_memory_bytes": total,
             "free_memory_bytes_at_start": free,
-            "nvidia_smi": nvidia_smi(index=index),
+            "nvidia_smi": smi,
+            "display": display_info((smi or {}).get("pci.bus_id")),
         }
     return meta
 
@@ -402,6 +452,14 @@ def format_summary(payload: dict[str, Any]) -> str:
             f"{smi.get('pcie.link.gen.gpumax', '?')}, host/CPU gen "
             f"{smi.get('pcie.link.gen.hostmax', '?')})"
         )
+        disp = gpu.get("display") or {}
+        if "display_active" in smi or disp:
+            outputs = ", ".join(disp.get("connected_outputs") or []) or "none"
+            boot = {True: "yes (desktop likely rendered here)", False: "no (desktop on another GPU)"}
+            out.append(
+                f"Display active {smi.get('display_active', '?')}, outputs: {outputs}; "
+                f"primary GPU: {boot.get(disp.get('boot_vga'), '?')}"
+            )
     out.append(
         f"SW     torch {tmeta.get('version', '-')} (CUDA {tmeta.get('cuda', '-')}), "
         f"triton {meta.get('triton') or '-'}, Python {meta.get('python', '-')}"

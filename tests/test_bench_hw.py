@@ -39,6 +39,56 @@ def test_tilde_hides_the_home_directory(bench):
     assert bench._tilde("/srv/data") == "/srv/data"
 
 
+def _fake_sysfs(root: Path, *, nvidia_boot_vga: str, outputs: dict[str, str]) -> None:
+    """Hybrid-laptop layout: dGPU at 01:00.0 (card1), iGPU at 06:00.0 (card2)."""
+    for address, card, boot in (("0000:01:00.0", "card1", nvidia_boot_vga),
+                                ("0000:06:00.0", "card2", "1" if nvidia_boot_vga == "0" else "0")):
+        dev = root / "bus" / "pci" / "devices" / address
+        dev.mkdir(parents=True)
+        (dev / "boot_vga").write_text(boot + "\n")
+        drm = root / "class" / "drm" / card
+        drm.mkdir(parents=True)
+        (drm / "device").symlink_to(dev)
+    drm = root / "class" / "drm"
+    for name, status in outputs.items():
+        (drm / name).mkdir()
+        (drm / name / "status").write_text(status + "\n")
+
+
+def test_sysfs_pci_address(bench):
+    assert bench._sysfs_pci_address("00000000:01:00.0") == "0000:01:00.0"
+    assert bench._sysfs_pci_address("0000000A:3B:00.1") == "000a:3b:00.1"
+    assert bench._sysfs_pci_address("garbage") is None
+
+
+def test_display_info_hybrid_with_external_monitor(bench, tmp_path):
+    _fake_sysfs(tmp_path, nvidia_boot_vga="0", outputs={
+        "card1-HDMI-A-1": "connected", "card1-DP-1": "disconnected", "card2-eDP-1": "connected",
+    })
+    info = bench.display_info("00000000:01:00.0", sysfs=tmp_path)
+    assert info == {"boot_vga": False, "connected_outputs": ["HDMI-A-1"]}
+
+
+def test_display_info_discrete_mode(bench, tmp_path):
+    _fake_sysfs(tmp_path, nvidia_boot_vga="1", outputs={"card1-eDP-2": "connected"})
+    info = bench.display_info("00000000:01:00.0", sysfs=tmp_path)
+    assert info == {"boot_vga": True, "connected_outputs": ["eDP-2"]}
+
+
+def test_display_info_without_sysfs(bench, tmp_path):
+    assert bench.display_info("00000000:01:00.0", sysfs=tmp_path) is None
+    assert bench.display_info(None, sysfs=tmp_path) is None
+
+
+def test_summary_shows_display_line(bench):
+    payload = {"metadata": {"gpu": {
+        "name": "GPU", "nvidia_smi": {"display_active": "Disabled"},
+        "display": {"boot_vga": False, "connected_outputs": []},
+    }}, "results": {}}
+    text = bench.format_summary(payload)
+    assert "Display active Disabled, outputs: none; primary GPU: no" in text
+
+
 def test_quick_config_and_overrides(bench):
     args = bench.parse_args(["--quick", "--nvme-file-gib", "0.1", "--pinned-cap-gib", "1"])
     cfg = bench.make_config(args)
