@@ -135,7 +135,7 @@ class RamSampler:
 
 
 SAFETENSORS_DTYPES = {"torch.float32": "F32", "torch.float16": "F16", "torch.bfloat16": "BF16",
-                      "torch.float64": "F64", "torch.int64": "I64"}  # fmt: skip
+                      "torch.float64": "F64", "torch.int64": "I64", "torch.uint8": "U8"}  # fmt: skip
 
 
 def tensor_bytes(tensor) -> bytes:

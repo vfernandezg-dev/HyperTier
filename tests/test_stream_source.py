@@ -861,6 +861,64 @@ def test_a_block_may_keep_some_tensors_in_the_stored_dtype(disk_tmp, safetensors
 
 
 @pytest.mark.cuda
+def test_a_converted_tensor_may_start_at_any_byte_of_the_file(disk_tmp, safetensors_writer):
+    """safetensors does not align tensors: after one of another dtype, float32 starts anywhere."""
+    import torch
+    from torch import nn
+
+    class Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.flag = nn.Parameter(torch.ones(1, dtype=torch.uint8), requires_grad=False)
+            self.gain = nn.Parameter(torch.randn(1).to(torch.bfloat16))
+            self.fc = nn.Linear(100, 100)
+
+        def forward(self, x):
+            return self.fc(x) * self.gain * self.flag
+
+    class Stack(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = nn.ModuleList(Block() for _ in range(4))
+
+        def forward(self, x):
+            for block in self.blocks:
+                x = block(x)
+            return x
+
+    def mixed(model):
+        model = copy.deepcopy(model)
+        for block in model.blocks:
+            block.fc.to(torch.bfloat16)
+        return model
+
+    torch.manual_seed(0)
+    trained = Stack().eval()
+    # In the order of the modules: one byte and two bytes, then the float32 weights. A block
+    # is 40403 bytes, so the weights of the four blocks start at 3, 2, 1 and 0 modulo 4.
+    stored = checkpoint_tensors(trained)
+    order = [name for name, _ in trained.named_parameters()]
+    safetensors_writer(disk_tmp / "model.safetensors", {name: stored[name] for name in order})
+    x = torch.randn(8, 100, device="cuda", dtype=torch.bfloat16)
+    expected = resident_outputs(mixed(trained), x, passes=2)
+    model = mixed(trained)
+    weights = FileWeights(disk_tmp, block_prefixes(model), cast=True)
+    starts = {
+        source % 4
+        for plan in weights.plan(torch, model.blocks)
+        for source, _, _, was, runs_in in plan.casts
+        if (was, runs_in) == ("F32", "BF16")
+    }
+    assert starts == {0, 1, 2, 3}, "the test needs float32 read from unaligned memory"
+    with LayerStreamer(model.blocks, weights=weights) as streamer, torch.no_grad():
+        assert streamer.tiers == ("ram",) * 4
+        y = x
+        for want in expected:
+            y = model(y)
+            assert torch.equal(y, want)
+
+
+@pytest.mark.cuda
 def test_persistent_buffers_are_converted_too(disk_tmp, safetensors_writer):
     import torch
     from torch import nn
