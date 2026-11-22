@@ -31,6 +31,12 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
     (resident on the GPU, on the CPU, or streamed).
   - F2 (KV-cache compression) last: where the KV cache lives depends on where attention is
     computed, and that is what F4 decides.
+- **F3 is in progress.** Landed: dtype conversion while loading (`FileWeights(cast=True)`) and
+  the Wan transformer with its sampling loop (`adapters/hf_diffusers.py`,
+  `diffusion/chunking.py`). Exit criterion: 720p x 49 frames, and 480p x 121 as the long mode
+  (the model does not guarantee quality at 480p). Measured on Wan 2.2 TI2V-5B with 2 slots:
+  latents equal to `WanPipeline` bit for bit, 0.80 GiB of weights in VRAM, 1.8 GiB allocated at
+  the peak and 12.8-13.9 s per pass at about 12,000 tokens, with the GPU at 85 °C.
 - F1 exit criterion, measured with `bench_llm` on Qwen3-8B (2 slots, all blocks in RAM): same
   tokens as the strict baseline, 0.77 GB of weights in VRAM, prefill overlap efficiency
   0.90-1.00; 2.28 s/token against 2.88 with `accelerate` offloading, at a third of its peak VRAM.
@@ -49,7 +55,8 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
 
 ```bash
 # one-time setup on Linux (apt deps, .venv, torch+triton, ".[dev,test]", verifies GPU, runs tests;
-# detects WSL2). The "test" extra is transformers + accelerate: model tests and bench_llm need it.
+# detects WSL2). The "test" extra is transformers, accelerate, diffusers and ftfy: the model
+# tests and bench_llm need it.
 bash scripts/setup_linux.sh
 source .venv/bin/activate
 
@@ -152,6 +159,24 @@ Create modules only when the current phase needs them.
    measurements. Below it, compute on the CPU the blocks that are in RAM; above it, stream
    them to the GPU. The F4 planner will choose the compute device per block and per phase
    (prefill, decoding). First case: `lm_head` on the CPU while decoding.
+
+9. **Diffusion is compared bit for bit.** In bfloat16 any change of shape in a kernel (a batch
+   of two, tokens in chunks, one row instead of N) changes about one unit in the last place.
+   The 30 blocks of a pass turn that into about 1 %, and the sampler into another video: 15 dB
+   of PSNR after 16 steps with the timestep collapsed to one per sample; the same scene with
+   other details. So equivalence means equal bits, and a threshold at the end of sampling
+   says nothing. What cannot be exact (the FFN in token chunks, a real batch) is judged by the
+   error of **one** pass against the reference: 0.8-1.5 % measured on Wan 2.2 TI2V-5B with the
+   FFN chunked.
+   The Wan adapter (`load_wan_transformer`, `denoise`) equals `WanPipeline` by doing what
+   `diffusers` does. Modules in `_keep_in_fp32_modules` stay in float32. The time embedding is
+   computed per token, and one row is kept after the embedder when every token has the same
+   timestep (the rows are equal; kept whole they cost 1.3 GiB more at 12,000 tokens); other
+   timesteps take the whole per-token path. A batch runs one sample at a time inside each
+   module (`one_sample_at_a_time`), so both branches of the guidance can share one pass over
+   the weights with the same bits. Two passes stay the default: one pass only wins while the
+   copy of a block outlasts its compute, below about 2,000 tokens on the reference laptop
+   (at 1,950 they tie: 3.58 s per step against 3.64, with 0.2 GiB more).
 
 ## Coding conventions
 
