@@ -47,6 +47,29 @@ class TensorEntry:
     offset: int  # of its first byte, from the start of ``path``
     nbytes: int
 
+    def rows(self, start: int, stop: int) -> TensorEntry:
+        """Rows ``start`` to ``stop`` (exclusive) along the first dimension, as an entry.
+
+        Tensors are stored row-major, so a range of rows is a contiguous range of bytes. This
+        is how a tensor larger than a VRAM slot is streamed in pieces, e.g. an output
+        projection of vocabulary x hidden split by vocabulary.
+        """
+        if not self.shape:
+            raise ValueError(f"tensor {self.name!r} is a scalar: it has no rows")
+        if not 0 <= start <= stop <= self.shape[0]:
+            raise ValueError(
+                f"rows {start}:{stop} are outside tensor {self.name!r} of {self.shape[0]} rows"
+            )
+        row_bytes = self.nbytes // self.shape[0] if self.shape[0] else 0
+        return TensorEntry(
+            f"{self.name}[{start}:{stop}]",
+            self.dtype,
+            (stop - start, *self.shape[1:]),
+            self.path,
+            self.offset + start * row_bytes,
+            (stop - start) * row_bytes,
+        )
+
 
 @dataclass(frozen=True)
 class Run:
@@ -100,31 +123,30 @@ class SafetensorsIndex(Mapping[str, TensorEntry]):
         between two tensors, up to ``max_gap``, are read along rather than paying for another
         request.
         """
-        if max_gap < 0:
-            raise ValueError(f"max_gap must be >= 0, got {max_gap}")
-        wanted = sorted({self._entries[name] for name in names}, key=_position)
-        runs: list[Run] = []
-        group: list[TensorEntry] = []
-        for entry in wanted:
-            if group:
-                last = group[-1]
-                gap = entry.offset - (last.offset + last.nbytes)
-                if entry.path != last.path or gap > max_gap:
-                    runs.append(_run(group))
-                    group = []
-            group.append(entry)
-        if group:
-            runs.append(_run(group))
-        return runs
+        return runs_of((self._entries[name] for name in names), max_gap=max_gap)
 
 
-def _position(entry: TensorEntry) -> tuple[str, int]:
-    return str(entry.path), entry.offset
+def runs_of(entries: Iterable[TensorEntry], *, max_gap: int = 0) -> list[Run]:
+    """:meth:`SafetensorsIndex.runs` for entries, which may be row ranges of tensors."""
+    if max_gap < 0:
+        raise ValueError(f"max_gap must be >= 0, got {max_gap}")
+    wanted = sorted(set(entries), key=_position)
+    runs: list[Run] = []
+    group: list[TensorEntry] = []
+    end = 0
+    for entry in wanted:
+        if group and (entry.path != group[0].path or entry.offset - end > max_gap):
+            runs.append(Run(group[0].path, group[0].offset, end - group[0].offset, tuple(group)))
+            group = []
+        end = max(end, entry.offset + entry.nbytes) if group else entry.offset + entry.nbytes
+        group.append(entry)
+    if group:
+        runs.append(Run(group[0].path, group[0].offset, end - group[0].offset, tuple(group)))
+    return runs
 
 
-def _run(group: list[TensorEntry]) -> Run:
-    first, last = group[0], group[-1]
-    return Run(first.path, first.offset, last.offset + last.nbytes - first.offset, tuple(group))
+def _position(entry: TensorEntry) -> tuple[str, int, int]:
+    return str(entry.path), entry.offset, entry.nbytes
 
 
 def _shards(root: Path) -> list[Path]:

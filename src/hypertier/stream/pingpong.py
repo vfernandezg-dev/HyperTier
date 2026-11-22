@@ -488,7 +488,7 @@ class LayerStreamer:
         if plans is None:
             layouts, sizes = _plan_layout(torch, self._blocks)
         else:
-            layouts, sizes = _file_layout(self._blocks, weights.prefixes, plans)
+            layouts, sizes = _file_layout(self._blocks, plans)
         largest = max(sizes)
         median = statistics.median(sizes)
         if median > 0 and largest > _OVERSIZE_RATIO * median:
@@ -611,6 +611,8 @@ class LayerStreamer:
     def _load_buffers(self, prefixes: Any) -> None:
         """Take the blocks' persistent buffers from the checkpoint; they stay on the device."""
         for number, (block, prefix) in enumerate(zip(self._blocks, prefixes)):
+            if not isinstance(prefix, str):
+                continue  # tensors given one by one: buffers have no name to look up
             for path, module in block.named_modules():
                 for key, buf in module._buffers.items():
                     name = f"{prefix}{path}.{key}" if path else prefix + key
@@ -890,16 +892,16 @@ def _plan_layout(
 
 
 def _file_layout(
-    modules: list[Any], prefixes: Any, plans: Any
+    modules: list[Any], plans: Any
 ) -> tuple[list[list[tuple[Any, int, int]]], list[int]]:
     """The layout of :func:`_plan_layout`, in the order the tensors have in their files."""
     owner: dict[int, int] = {}
     layouts: list[list[tuple[Any, int, int]]] = []
-    for index, (block, prefix, plan) in enumerate(zip(modules, prefixes, plans)):
+    for index, (block, plan) in enumerate(zip(modules, plans)):
         params = dict(block.named_parameters())
         entries = []
-        for tensor, offset in plan.entries:
-            param = params[tensor.name[len(prefix) :]]
+        for name, (tensor, offset) in zip(plan.names, plan.entries):
+            param = params[name]
             if owner.setdefault(id(param), index) != index:
                 raise ValueError(
                     f"parameter {tensor.name!r} of block {index} also belongs to block "

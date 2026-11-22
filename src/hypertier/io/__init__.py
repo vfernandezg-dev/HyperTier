@@ -6,6 +6,6 @@ without the page cache (``direct``). Importing this package never imports PyTorc
 """
 
 from hypertier.io.direct import DirectReader, aligned_span
-from hypertier.io.safetensors_index import Run, SafetensorsIndex, TensorEntry
+from hypertier.io.safetensors_index import Run, SafetensorsIndex, TensorEntry, runs_of
 
-__all__ = ["DirectReader", "Run", "SafetensorsIndex", "TensorEntry", "aligned_span"]
+__all__ = ["DirectReader", "Run", "SafetensorsIndex", "TensorEntry", "aligned_span", "runs_of"]
