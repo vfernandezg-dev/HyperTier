@@ -9,8 +9,10 @@ HyperTier is an open-source **tiered-memory inference runtime** (Python + PyTorc
 Goal: run very large models (15 GB → 400 GB+) on consumer GPUs with **4 GB of VRAM** by treating
 VRAM as the fastest tier of `VRAM ◄ pinned RAM ◄ NVMe` and moving weights, experts and caches just
 in time, overlapped with compute. Modality-agnostic: LLMs/MoE, video & image diffusion (DiT), multimodal.
-Reference hardware: **RTX 3050 Laptop (4 GB, Ampere sm_86) + 32 GB RAM + NVMe**, native Linux
-(Ubuntu 26.04, NVIDIA driver 595, system Python 3.14).
+Reference hardware: **RTX 3050 Laptop (4 GB, Ampere sm_86) + 32 GB RAM + NVMe** (Lenovo Legion 5,
+Ryzen 7 5800H, PCIe Gen3 x8), native Linux: Ubuntu 26.04, NVIDIA driver 595, system Python 3.14.
+Measured there (`bench_hw`): H2D/D2H pinned ≈ 6.6 GB/s, NVMe O_DIRECT read ≈ 3.0 GB/s, pinned RAM
+up to 21 GiB, copy/compute overlap ≈ 0.97.
 
 ## Status
 
@@ -25,7 +27,7 @@ Reference hardware: **RTX 3050 Laptop (4 GB, Ampere sm_86) + 32 GB RAM + NVMe**,
 ## Commands
 
 ```bash
-# one-time setup on native Linux (apt deps, .venv, torch+triton, verifies GPU, runs tests)
+# one-time setup on Linux (apt deps, .venv, torch+triton, verifies GPU, runs tests; detects WSL2)
 bash scripts/setup_linux.sh
 source .venv/bin/activate
 
@@ -61,7 +63,10 @@ Create modules only when the current phase needs them.
 ## Architecture decisions (do not silently reverse)
 
 1. **The bottleneck is bandwidth, not VRAM.** `time ≥ max(compute, non_resident_bytes / link_bw)`.
-   Every feature must state its effect on bytes moved per pass.
+   Every feature must state its effect on bytes moved per pass. The planner models a pass as
+   `t ≈ max(c, x) + (1 − e)·min(c, x)` (`c` compute, `x` transfer, `e` copy/compute overlap
+   efficiency). Take `e` from `bench_hw` on the target machine, never hard-code it:
+   ≈ 0.95 on native Linux, ≈ 0.7 on WSL2 for copies ≥ 64 MiB (issue #1).
 2. **KV cache = TurboQuant-MSE** (random rotation + Lloyd-Max codebook per coordinate, calibration-free).
    **QJL residual is OFF by default** (hurts softmax attention at equal bit budget; arXiv:2605.08114).
    Give keys more bits than values. Keep boundary layers and a recent-token window in fp16.
@@ -75,8 +80,9 @@ Create modules only when the current phase needs them.
    Do not compress activations in the compute path; use chunking/tiling (exact) instead.
 6. **Triton first, PyTorch fallback.** Kernels must also run under `TRITON_INTERPRET=1` and be
    tested bit-exact (or within tolerance) against a pure-PyTorch reference.
-7. **Native Linux first.** WSL2 and Windows are not targeted; Windows only through the PyTorch
-   fallback. Telemetry still detects WSL (`is_wsl()`) so foreign results are labelled, not trusted.
+7. **Native Linux first.** Development and benchmarks run on native Linux only; WSL2 is no longer
+   used for either. WSL2 stays **supported for users**: `setup_linux.sh` and telemetry detect it
+   (`is_wsl()`), and `bench_hw` labels its results. Native Windows only via the PyTorch fallback.
 
 ## Coding conventions
 
