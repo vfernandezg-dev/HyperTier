@@ -203,6 +203,32 @@ def test_falls_back_to_the_pytorch_pinned_allocator_with_a_warning(monkeypatch, 
 
 
 @pytest.mark.cuda
+@pytest.mark.filterwarnings("ignore:could not page-lock")
+def test_fallback_memory_that_starts_off_a_page_still_serves_page_aligned_requests(monkeypatch):
+    import torch
+
+    from hypertier.telemetry.bandwidth import release_pinned_cache
+
+    def missing():
+        raise AttributeError("this PyTorch has no cudart binding")
+
+    monkeypatch.setattr(torch.cuda, "cudart", missing)
+    release_pinned_cache()
+    # PyTorch packs small pinned requests into one segment, 512 bytes apart, and makes some
+    # itself (reading a scalar from the GPU): whatever is pinned next starts off a page.
+    tiny = torch.empty(8, dtype=torch.uint8, pin_memory=True)
+    with PinnedPool(0, segment_bytes=MiB) as pool:
+        first = pool.alloc(100)
+        assert first.data_ptr() % PAGE, "the premise: this pinned memory is not page-aligned"
+        assert first.data_ptr() % ALIGN == 0
+        page = pool.alloc(3 * PAGE, align=PAGE)
+        assert page.data_ptr() % PAGE == 0 and page.is_pinned()
+        whole = pool.alloc(MiB, align=PAGE)  # as large as a segment: needs room to align
+        assert whole.data_ptr() % PAGE == 0 and whole.numel() == MiB
+    del tiny
+
+
+@pytest.mark.cuda
 @pytest.mark.parametrize("cuda_torn_down", [False, True])
 def test_exiting_without_close_is_silent(cuda_torn_down):
     code = [

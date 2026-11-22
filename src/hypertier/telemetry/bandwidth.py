@@ -682,6 +682,11 @@ class AlignedBuffer:
     numpy), so ``readinto`` lands bytes directly in DMA-able memory: the NVMe -> pinned RAM
     leg of the streaming path. Unpinned buffers are anonymous mmaps, page-aligned by
     construction.
+
+    A pinned tensor is not page-aligned by itself: PyTorch's pinned allocator packs small
+    requests into a shared segment in steps of 512 bytes, and PyTorch makes such requests on
+    its own (reading a scalar back from the GPU is one). So the tensor is one alignment unit
+    longer than asked and the view starts at the first aligned address inside it.
     """
 
     def __init__(self, nbytes: int, *, pinned: bool) -> None:
@@ -693,10 +698,11 @@ class AlignedBuffer:
         self._mmap: mmap.mmap | None = None
         if pinned:
             torch = require_cuda()
-            self._tensor = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+            self._tensor = torch.empty(
+                nbytes + DIRECT_IO_ALIGN, dtype=torch.uint8, pin_memory=True
+            )
             address = self._tensor.data_ptr()
-            if address % DIRECT_IO_ALIGN:
-                raise RuntimeError("pinned buffer is not page-aligned; O_DIRECT would fail")
+            address += -address % DIRECT_IO_ALIGN
             raw = (ctypes.c_ubyte * nbytes).from_address(address)
             self.view = memoryview(raw).cast("B")
         else:
