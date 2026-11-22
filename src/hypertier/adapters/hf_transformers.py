@@ -27,18 +27,16 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import mmap
-from collections.abc import Iterator
 from itertools import pairwise
-from math import prod
 from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from hypertier.io.safetensors_index import SafetensorsIndex, TensorEntry
+from hypertier.adapters import _skeleton as skeleton
+from hypertier.io.safetensors_index import SafetensorsIndex
 from hypertier.stream.pingpong import LayerStreamer, find_blocks
 from hypertier.stream.pinned import ALIGN, align_up
-from hypertier.stream.source import FileWeights, read_tensor, torch_dtype
+from hypertier.stream.source import FileWeights
 from hypertier.telemetry._common import format_bytes, require_cuda, resolve_device
 
 if TYPE_CHECKING:
@@ -47,8 +45,6 @@ if TYPE_CHECKING:
 
 MIN_TRANSFORMERS = (5, 24)
 """Oldest ``transformers`` this adapter is tested with; the ``[hf]`` extra pins the same."""
-
-_FLOATING = frozenset({"BF16", "F16", "F32", "F64"})
 
 
 def head_rows(rows: int, row_bytes: int, chunk_bytes: int) -> list[tuple[int, int]]:
@@ -175,9 +171,9 @@ def load_causal_lm(
     root = Path(model_dir)
     index = SafetensorsIndex(root)
     config = transformers.AutoConfig.from_pretrained(root)
-    with _parameters_on_meta(torch):
+    with skeleton.parameters_on_meta(torch):
         model = transformers.AutoModelForCausalLM.from_config(
-            config, dtype=_checkpoint_dtype(torch, index)
+            config, dtype=skeleton.checkpoint_dtype(torch, index)
         )
     model.eval()
     with contextlib.suppress(OSError):  # a checkpoint without one keeps the defaults
@@ -198,14 +194,16 @@ def load_causal_lm(
     if embedding_name.startswith(inside) or head_name.startswith(inside):
         raise ValueError("the embedding or the output projection is inside the decoder layers")
 
-    embedding_entry = _entry(index, f"{embedding_name}.weight")
+    embedding_entry = skeleton.require_entry(index, f"{embedding_name}.weight")
     tied = head.weight is embedding.weight
     head_entry = index.get(f"{head_name}.weight")
     if head_entry is None:
         if not tied:
-            _entry(index, f"{head_name}.weight")  # raises, naming the tensor
+            skeleton.require_entry(index, f"{head_name}.weight")  # raises, naming the tensor
         head_entry = embedding_entry
-    bias_entry = None if head.bias is None else _entry(index, f"{head_name}.bias")
+    bias_entry = (
+        None if head.bias is None else skeleton.require_entry(index, f"{head_name}.bias")
+    )
     if head_entry.shape != tuple(head.weight.shape):
         raise ValueError(
             f"{head_entry.name!r} is {list(head_entry.shape)} in the checkpoint, but the "
@@ -235,11 +233,13 @@ def load_causal_lm(
     streamer = None
     try:
         # The embedding reads its rows from the file; ids come down to it, activations go up.
-        undo.append(functools.partial(_set, embedding, "weight", embedding.weight))
-        table = _checked_map(torch, embedding_entry, embedding.weight)
-        _set(embedding, "weight", _frozen(torch, table))
-        down = embedding.register_forward_pre_hook(_inputs_to_cpu, with_kwargs=True)
-        up = embedding.register_forward_hook(functools.partial(_output_to, dev))
+        undo.append(
+            functools.partial(skeleton.set_attribute, embedding, "weight", embedding.weight)
+        )
+        table = skeleton.checked_map(torch, embedding_entry, embedding.weight)
+        skeleton.set_attribute(embedding, "weight", skeleton.frozen(torch, table))
+        down = embedding.register_forward_pre_hook(skeleton.inputs_to_cpu, with_kwargs=True)
+        up = embedding.register_forward_hook(functools.partial(skeleton.output_to, dev))
         undo += [down.remove, up.remove]
 
         parent = model.get_submodule(head_name.rpartition(".")[0])
@@ -248,7 +248,7 @@ def load_causal_lm(
         undo.append(functools.partial(setattr, parent, attribute, head))
 
         skip = {id(m) for m in (*layers.modules(), *embedding.modules(), *chunked.modules())}
-        resident_bytes = _make_resident(torch, model, index, dev, skip, undo)
+        resident_bytes = skeleton.make_resident(torch, model, index, dev, skip, undo)
 
         weights = FileWeights(index, sources, ram_budget=ram_budget, num_stage=num_stage)
         streamer = LayerStreamer(
@@ -257,7 +257,7 @@ def load_causal_lm(
         # generate() sends its inputs to model.device, which would otherwise be the device
         # of the first parameter: the embedding, on the CPU.
         original = type(model)
-        model.__class__ = _on_device_type(original, dev)
+        model.__class__ = skeleton.on_device_type(original, dev)
         undo.append(functools.partial(setattr, model, "__class__", original))
     except BaseException:
         if streamer is not None:
@@ -280,7 +280,7 @@ def _import_transformers() -> Any:
         raise RuntimeError(
             "this adapter needs Hugging Face transformers: pip install hypertier[hf]"
         ) from exc
-    found = _version(transformers.__version__)
+    found = skeleton.version_tuple(transformers.__version__)
     if found < MIN_TRANSFORMERS:
         wanted = ".".join(map(str, MIN_TRANSFORMERS))
         raise RuntimeError(
@@ -288,151 +288,6 @@ def _import_transformers() -> Any:
             "pip install -U hypertier[hf]"
         )
     return transformers
-
-
-def _version(text: str) -> tuple[int, ...]:
-    """The leading numbers of a version string: ``"5.24.0.dev0"`` -> ``(5, 24, 0)``."""
-    numbers = []
-    for part in text.split("."):
-        if not part.isdigit():
-            break
-        numbers.append(int(part))
-    return tuple(numbers)
-
-
-@contextlib.contextmanager
-def _parameters_on_meta(torch: Any) -> Iterator[None]:
-    """Send every ``Parameter`` registered while this lasts to ``meta``: shape, no memory.
-
-    Unlike building under ``torch.device("meta")``, buffers are left alone, so the tables a
-    model computes in ``__init__`` hold real values, computed on the CPU as in a normal load
-    (computed on the GPU they differ in the last bits). Weight initialisation runs on ``meta``
-    tensors, where it costs nothing.
-    """
-
-    def to_meta(module: Any, name: str, param: Any) -> Any:
-        if param is None or param.device.type == "meta":
-            return None  # includes tied weights: they stay one object
-        empty = torch.empty(param.shape, dtype=param.dtype, device="meta")
-        return torch.nn.Parameter(empty, requires_grad=False)
-
-    handle = torch.nn.modules.module.register_module_parameter_registration_hook(to_meta)
-    try:
-        yield
-    finally:
-        handle.remove()
-
-
-def _checkpoint_dtype(torch: Any, index: SafetensorsIndex) -> Any:
-    """The floating dtype that holds most bytes of the checkpoint: what the model is built in."""
-    nbytes: dict[str, int] = {}
-    for entry in index.values():
-        if entry.dtype in _FLOATING:
-            nbytes[entry.dtype] = nbytes.get(entry.dtype, 0) + entry.nbytes
-    if not nbytes:
-        raise ValueError("the checkpoint has no floating-point tensors")
-    return torch_dtype(torch, max(nbytes, key=nbytes.__getitem__))
-
-
-def _entry(index: SafetensorsIndex, name: str) -> TensorEntry:
-    entry = index.get(name)
-    if entry is None:
-        raise ValueError(
-            f"tensor {name!r} is not in the checkpoint; this adapter needs a checkpoint that "
-            "names its tensors as the model's modules do"
-        )
-    return entry
-
-
-def _frozen(torch: Any, tensor: Any) -> Any:
-    return torch.nn.Parameter(tensor, requires_grad=False)
-
-
-def _set(module: Any, name: str, value: Any) -> None:
-    setattr(module, name, value)
-
-
-def _mapped_tensor(torch: Any, entry: TensorEntry) -> Any:
-    """A CPU tensor over the bytes of ``entry`` in its file; pages are read when touched.
-
-    The mapping is private and writable, because PyTorch has no read-only tensors: a stray
-    write would change this process's copy of a page, never the file.
-    """
-    dtype = torch_dtype(torch, entry.dtype)
-    if entry.nbytes == 0:
-        return torch.empty(entry.shape, dtype=dtype)
-    start = entry.offset - entry.offset % mmap.ALLOCATIONGRANULARITY
-    with open(entry.path, "rb") as f:
-        mapping = mmap.mmap(
-            f.fileno(), entry.offset - start + entry.nbytes, access=mmap.ACCESS_COPY, offset=start
-        )
-    # The tensor keeps the mapping alive; it is never closed by hand.
-    flat = torch.frombuffer(
-        mapping, dtype=dtype, count=prod(entry.shape), offset=entry.offset - start
-    )
-    return flat.view(entry.shape)
-
-
-def _inputs_to_cpu(module: Any, args: Any, kwargs: Any) -> Any:
-    def down(value: Any) -> Any:
-        return value.to("cpu") if hasattr(value, "device") else value
-
-    return tuple(down(a) for a in args), {key: down(value) for key, value in kwargs.items()}
-
-
-def _output_to(device: Any, module: Any, args: Any, output: Any) -> Any:
-    return output.to(device)
-
-
-def _make_resident(
-    torch: Any, model: Any, index: SafetensorsIndex, device: Any, skip: set[int], undo: list[Any]
-) -> int:
-    """Put on the GPU every parameter and buffer outside the modules in ``skip``.
-
-    Parameters come from the checkpoint. So do the buffers stored in it; the others keep the
-    value the model's ``__init__`` computed on the CPU. Returns the bytes now on the device.
-    """
-    nbytes = 0
-    for prefix, module in model.named_modules():
-        if id(module) in skip:
-            continue
-        dot = prefix + "." if prefix else ""
-        for key, param in list(module._parameters.items()):
-            if param is None:
-                continue
-            entry = _entry(index, dot + key)
-            value = _checked(torch, entry, param).to(device)
-            _set(module, key, _frozen(torch, value))
-            undo.append(functools.partial(_set, module, key, param))
-            nbytes += entry.nbytes
-        for key, buf in list(module._buffers.items()):
-            if buf is None:
-                continue
-            entry = None if key in module._non_persistent_buffers_set else index.get(dot + key)
-            value = buf if entry is None else _checked(torch, entry, buf)
-            module._buffers[key] = value.to(device)
-            undo.append(functools.partial(module._buffers.__setitem__, key, buf))
-            nbytes += value.numel() * value.element_size()
-    return nbytes
-
-
-def _check(torch: Any, entry: TensorEntry, like: Any) -> None:
-    if entry.shape != tuple(like.shape) or torch_dtype(torch, entry.dtype) != like.dtype:
-        raise ValueError(
-            f"{entry.name!r} is {entry.dtype} {list(entry.shape)} in the checkpoint, but the "
-            f"model expects {like.dtype} {list(like.shape)}"
-        )
-
-
-def _checked(torch: Any, entry: TensorEntry, like: Any) -> Any:
-    """The tensor of ``entry`` read into memory, after checking it is what the model expects."""
-    _check(torch, entry, like)
-    return read_tensor(torch, entry)
-
-
-def _checked_map(torch: Any, entry: TensorEntry, like: Any) -> Any:
-    _check(torch, entry, like)
-    return _mapped_tensor(torch, entry)
 
 
 @functools.cache
@@ -461,18 +316,6 @@ def _chunked_linear_type(torch: Any) -> Any:
             return torch.cat([chunk(x) for chunk in self.chunks], dim=-1)
 
     return ChunkedLinear
-
-
-@functools.cache
-def _on_device_type(cls: type, device: Any) -> type:
-    """``cls`` with ``device`` fixed: a subclass made for the instances that are streamed."""
-    body = {
-        "device": property(lambda self: device),
-        "__module__": cls.__module__,
-        "__qualname__": cls.__qualname__,
-        "__doc__": cls.__doc__,
-    }
-    return type(cls.__name__, (cls,), body)
 
 
 __all__ = ["MIN_TRANSFORMERS", "StreamedModel", "head_rows", "load_causal_lm"]
