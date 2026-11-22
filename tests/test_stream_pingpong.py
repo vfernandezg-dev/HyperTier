@@ -412,6 +412,44 @@ def test_parameters_live_in_pinned_ram_and_run_from_aligned_slot_views():
 
 
 @pytest.mark.cuda
+def test_blocks_get_their_own_parameters_back_after_running():
+    import torch
+
+    model = toy_mlp(3, 64)
+    mine = model.blocks[1].fc1.weight  # a reference held by the caller, e.g. an optimizer
+    during = []
+    handle = model.blocks[1].register_forward_pre_hook(
+        lambda module, args: during.append(module.fc1.weight)
+    )
+    with LayerStreamer(model.blocks), torch.no_grad():
+        model(torch.randn(2, 64, device="cuda"))
+        assert model.blocks[1].fc1.weight is mine and mine.device.type == "cpu"
+        assert during[0] is not mine and during[0].device.type == "cuda"
+        assert not during[0].requires_grad
+    handle.remove()
+    assert model.blocks[1].fc1.weight is mine and mine.requires_grad
+
+
+@pytest.mark.cuda
+@pytest.mark.filterwarnings("ignore:RNN module weights are not part of single contiguous")
+def test_modules_that_track_their_parameters_stream_too():
+    import torch
+    from torch import nn
+
+    # torch.nn RNNs keep a flat list of their Parameter objects besides ``_parameters``.
+    blocks = nn.ModuleList(nn.LSTM(32, 32, batch_first=True) for _ in range(3)).eval()
+    reference = copy.deepcopy(blocks).cuda()
+    x = torch.randn(2, 5, 32, device="cuda")
+    with LayerStreamer(blocks), torch.no_grad():
+        for _ in range(2):
+            y, want = x, x
+            for block, ref in zip(blocks, reference):
+                y, want = block(y)[0], ref(want)[0]
+            assert torch.equal(y, want)
+    assert all(w.device.type == "cpu" for block in blocks for w in block._flat_weights)
+
+
+@pytest.mark.cuda
 def test_buffers_become_resident_and_return_on_close():
     import torch
     from torch import nn

@@ -78,8 +78,10 @@ Create modules only when the current phase needs them.
    Give keys more bits than values. Keep boundary layers and a recent-token window in fp16.
 3. **Bit-plane packing** for any bit-width; attention scores computed on packed keys without
    de-rotating (`<q,k> = ‖k‖·<Rq, c[idx]>`); values accumulated in rotated basis, de-rotated once.
-4. **Model-agnostic streaming via forward hooks** that repoint `param.data` to VRAM slot views.
-   Do not rewrite model classes. Slots are assigned **LRU, never `i % num_slots`** (breaks with odd
+4. **Model-agnostic streaming via forward hooks** that swap each block's `Parameter` objects
+   for ones viewing its VRAM slot, and swap the originals back afterwards. Not `param.data`: it
+   cannot switch to or from a `meta` placeholder, which blocks read from disk use while they
+   are not loaded. Do not rewrite model classes. Slots are assigned **LRU, never `i % num_slots`** (breaks with odd
    block counts + cyclic prefetch), and LRU never evicts a block of the current prefetch window
    (plain LRU drops pending prefetches from 4 slots up). CUDA events: `slot_ready` (compute waits
    copy), `slot_free` (copy waits compute). Every parameter is aligned to 256 B in RAM and VRAM.
