@@ -632,6 +632,12 @@ class LayerStreamer:
                     stored = None if buf is None else self._backend.read_buffer(name)
                     if stored is None:
                         continue
+                    if (
+                        self._weights.cast
+                        and stored.is_floating_point()
+                        and buf.is_floating_point()
+                    ):
+                        stored = stored.to(buf.dtype)
                     if stored.shape != buf.shape or stored.dtype != buf.dtype:
                         raise ValueError(
                             f"block {number}: buffer {name!r} is {stored.dtype} "
@@ -922,7 +928,8 @@ def _file_layout(
                     f"parameter {tensor.name!r} of block {index} also belongs to block "
                     f"{owner[id(param)]}; streamed blocks cannot share parameters"
                 )
-            entries.append((param, offset, tensor.nbytes))
+            # The size it has in the slot: not the stored one when the file is converted.
+            entries.append((param, offset, param.numel() * param.element_size()))
         layouts.append(entries)
     return layouts, [plan.size for plan in plans]
 
