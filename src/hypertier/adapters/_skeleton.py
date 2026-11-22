@@ -127,12 +127,21 @@ def output_to(device: Any, module: Any, args: Any, output: Any) -> Any:
 
 
 def make_resident(
-    torch: Any, model: Any, index: SafetensorsIndex, device: Any, skip: set[int], undo: list[Any]
+    torch: Any,
+    model: Any,
+    index: SafetensorsIndex,
+    device: Any,
+    skip: set[int],
+    undo: list[Any],
+    *,
+    cast: bool = False,
 ) -> int:
     """Put on the GPU every parameter and buffer outside the modules in ``skip``.
 
     Parameters come from the checkpoint. So do the buffers stored in it; the others keep the
-    value the model's ``__init__`` computed on the CPU. Returns the bytes now on the device.
+    value the model's ``__init__`` computed on the CPU. With ``cast``, a tensor stored in
+    another floating-point dtype than the model's is converted on the CPU, as
+    ``Tensor.to(dtype)`` does. Returns the bytes now on the device.
     """
     nbytes = 0
     for prefix, module in model.named_modules():
@@ -143,33 +152,35 @@ def make_resident(
             if param is None:
                 continue
             entry = require_entry(index, dot + key)
-            value = checked(torch, entry, param).to(device)
+            value = checked(torch, entry, param, cast=cast).to(device)
             set_attribute(module, key, frozen(torch, value))
             undo.append(functools.partial(set_attribute, module, key, param))
-            nbytes += entry.nbytes
+            nbytes += value.numel() * value.element_size()
         for key, buf in list(module._buffers.items()):
             if buf is None:
                 continue
             entry = None if key in module._non_persistent_buffers_set else index.get(dot + key)
-            value = buf if entry is None else checked(torch, entry, buf)
+            value = buf if entry is None else checked(torch, entry, buf, cast=cast)
             module._buffers[key] = value.to(device)
             undo.append(functools.partial(module._buffers.__setitem__, key, buf))
             nbytes += value.numel() * value.element_size()
     return nbytes
 
 
-def check(torch: Any, entry: TensorEntry, like: Any) -> None:
-    if entry.shape != tuple(like.shape) or torch_dtype(torch, entry.dtype) != like.dtype:
+def check(torch: Any, entry: TensorEntry, like: Any, *, cast: bool = False) -> None:
+    stored = torch_dtype(torch, entry.dtype)
+    converts = cast and stored.is_floating_point and like.dtype.is_floating_point
+    if entry.shape != tuple(like.shape) or not (stored == like.dtype or converts):
         raise ValueError(
             f"{entry.name!r} is {entry.dtype} {list(entry.shape)} in the checkpoint, but the "
             f"model expects {like.dtype} {list(like.shape)}"
         )
 
 
-def checked(torch: Any, entry: TensorEntry, like: Any) -> Any:
+def checked(torch: Any, entry: TensorEntry, like: Any, *, cast: bool = False) -> Any:
     """The tensor of ``entry`` read into memory, after checking it is what the model expects."""
-    check(torch, entry, like)
-    return read_tensor(torch, entry)
+    check(torch, entry, like, cast=cast)
+    return read_tensor(torch, entry).to(like.dtype)
 
 
 def checked_map(torch: Any, entry: TensorEntry, like: Any) -> Any:
