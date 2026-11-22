@@ -14,7 +14,7 @@ VRAM held for weights, and whether the output is bit-exact.
 Everything, plus the metadata needed to reproduce the run, goes to
 ``benchmarks/results/streaming_<UTC timestamp>.json``; a summary table is printed.
 
-    python benchmarks/bench_streaming.py            # ~1 min, ~1.4 GiB of RAM, ~0.9 GiB of VRAM
+    python benchmarks/bench_streaming.py            # ~1 min, ~1 GiB of RAM, ~0.9 GiB of VRAM
     python benchmarks/bench_streaming.py --quick    # tiny sizes, smoke test
 """
 
@@ -185,7 +185,7 @@ def measure_streamed(
         "streamed_bytes": streamer.streamed_bytes,
         "weights_vram_bytes": streamer.vram_bytes,
         "build_seconds": time.perf_counter() - t0,
-        "pinned_bytes": streamer._pool.capacity_bytes,
+        "pinned_bytes": streamer._pool.capacity_bytes,  # page-locked RAM holding the weights
         "pin_seconds": streamer._pool.pin_seconds,
     }
     cases = []
@@ -213,7 +213,7 @@ def measure_streamed(
                     "copies_per_pass": _median([s.copies for s in stats]),
                     "bytes_per_pass": _median([s.bytes_copied for s in stats]),
                     "copy_gbps": bw.gb_per_s(_median([s.bytes_copied for s in stats]), copy_ms),
-                    "misses": sum(s.misses for s in stats),
+                    "misses_per_pass": _median([s.misses for s in stats]),
                     # Both against the resident pass: the copies' effect on compute counts.
                     "efficiency": bw.overlap_efficiency(copy_ms, base["pass_ms"], pass_ms),
                     "efficiency_in_situ": _median(in_situ) if in_situ else None,
@@ -268,7 +268,8 @@ def format_summary(payload: dict[str, Any]) -> str:
         out += [
             "",
             "Per pass, medians. eff = share of the shorter of (copy, resident compute) hidden;",
-            "bound = max(resident compute, copy) / streamed. Times in ms.",
+            "bound = max(resident compute, copy) / streamed; miss = blocks loaded on demand",
+            "instead of prefetched. Times in ms.",
             (
                 f"{'rows':>6}{'slots':>6}{'resident':>10}{'copy':>8}{'streamed':>10}{'stall':>8}"
                 f"{'eff':>7}{'bound':>7}{'GB/s':>7}{'miss':>6}  exact"
@@ -278,7 +279,7 @@ def format_summary(payload: dict[str, Any]) -> str:
             out.append(
                 f"{c['rows']:>6}{c['slots']:>6}{c['resident_ms']:>10.1f}{c['copy_ms']:>8.1f}"
                 f"{c['streamed_ms']:>10.1f}{c['stall_ms']:>8.1f}{c['efficiency']:>7.2f}"
-                f"{c['bound_fraction']:>7.2f}{c['copy_gbps']:>7.2f}{c['misses']:>6}  "
+                f"{c['bound_fraction']:>7.2f}{c['copy_gbps']:>7.2f}{c['misses_per_pass']:>6.0f}  "
                 f"{'yes' if c['bit_exact'] else 'NO'}"
             )
     return "\n".join(out)
