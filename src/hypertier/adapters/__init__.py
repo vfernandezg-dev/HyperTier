@@ -5,6 +5,6 @@
 their classes. Each needs an optional extra; importing this package imports none of them.
 """
 
-from hypertier.adapters.hf_transformers import StreamedModel, load_causal_lm
+from hypertier.adapters.hf_transformers import StreamedModel, load_causal_lm, load_text_encoder
 
-__all__ = ["StreamedModel", "load_causal_lm"]
+__all__ = ["StreamedModel", "load_causal_lm", "load_text_encoder"]

@@ -1,7 +1,7 @@
 # Copyright 2026 The HyperTier Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run a Hugging Face ``transformers`` causal language model that does not fit in VRAM.
+"""Run a Hugging Face ``transformers`` model that does not fit in VRAM.
 
 :func:`load_causal_lm` returns the ordinary ``transformers`` model, to be called or driven by
 ``generate()`` as usual, with its weights placed by size and by how they are used::
@@ -12,6 +12,9 @@
     output projection streamed too, split by vocabulary rows into pieces no larger than a
                       layer; whole, it would make every slot three times as big
     everything else   (final norm, rotary tables...) resident on the GPU: kilobytes
+
+:func:`load_text_encoder` does the same for an encoder-only model (T5, umT5), the text stage
+of a diffusion pipeline: embedding on the CPU, encoder blocks streamed, the rest resident.
 
 The model classes are not rewritten. The model is built by its own ``__init__`` with every
 parameter sent to the ``meta`` device as it is registered, so no weight is ever allocated in
@@ -76,7 +79,8 @@ class StreamedModel:
             ``pass_stats()``: a pass is one forward of the model, i.e. the prompt or one
             generated token.
         device: the GPU that computes.
-        head_rows: the vocabulary ranges the output projection is streamed in.
+        head_rows: the vocabulary ranges the output projection is streamed in; empty for a
+            model without one (a text encoder).
         resident_bytes: weights and buffers kept on the GPU outside the slots.
         embedding_bytes: size of the token embedding, which stays in the file (page cache).
     """
@@ -232,15 +236,8 @@ def load_causal_lm(
     undo: list[Any] = []
     streamer = None
     try:
-        # The embedding reads its rows from the file; ids come down to it, activations go up.
-        undo.append(
-            functools.partial(skeleton.set_attribute, embedding, "weight", embedding.weight)
-        )
         table = skeleton.checked_map(torch, embedding_entry, embedding.weight)
-        skeleton.set_attribute(embedding, "weight", skeleton.frozen(torch, table))
-        down = embedding.register_forward_pre_hook(skeleton.inputs_to_cpu, with_kwargs=True)
-        up = embedding.register_forward_hook(functools.partial(skeleton.output_to, dev))
-        undo += [down.remove, up.remove]
+        _look_up_on_cpu(embedding, skeleton.frozen(torch, table), dev, undo)
 
         parent = model.get_submodule(head_name.rpartition(".")[0])
         attribute = head_name.rpartition(".")[2]
@@ -270,7 +267,128 @@ def load_causal_lm(
     )
 
 
+def load_text_encoder(
+    model_dir: str | PathLike[str],
+    *,
+    slots: int = 2,
+    keep_in_ram: bool = False,
+    num_stage: int = 2,
+    device: torch.device | str = "cuda",
+) -> StreamedModel:
+    """Load an encoder-only text model (T5, umT5) from a local directory, streamed.
+
+    This is the text stage of a diffusion pipeline. Call ``model(input_ids, attention_mask)``
+    with both on ``device``, under ``torch.no_grad()`` or ``torch.inference_mode()``.
+
+    Args:
+        model_dir: a ``transformers`` model directory with safetensors weights. Nothing is
+            downloaded.
+        slots: VRAM buffers, each as large as the largest encoder block.
+        keep_in_ram: where the blocks wait between calls. False reads every block from disk
+            on each call, with only the staging buffers page-locked: right for an encoder
+            that runs once per prompt, since nothing is read or locked that is not then used
+            once. True keeps them all in page-locked RAM, which pays when many prompts are
+            encoded. Measured on the umT5-XXL of Wan 2.2 (8.63 GiB of blocks, two prompts of
+            512 tokens, reference laptop): from disk, 1.7 s to load and 3.4 s per call with
+            0.72 GiB locked; in RAM, 9.8 s to load and 1.4-1.8 s per call with 8.63 GiB.
+        num_stage: staging buffers for the blocks read from disk.
+        device: the CUDA device that computes.
+
+    Bytes moved per call: every encoder block to VRAM once, from disk or from RAM, plus the
+    activations of the embedding. The length of the prompts does not change it, and neither
+    does their number, so encoding prompts together costs one pass instead of one each. A
+    batch of another size does not round like a batch of one, though: to reproduce a pipeline
+    that encodes its prompts one by one, do the same.
+
+    Limits:
+
+    * Encoder-only models whose checkpoint names its tensors as the modules do, with an
+      ``nn.Embedding`` going in. Anything else raises.
+    * As for :func:`load_causal_lm`: the model is built with every ``Parameter`` of the
+      process sent to ``meta`` meanwhile, and the limits of
+      :class:`~hypertier.stream.LayerStreamer` apply.
+    """
+    torch = require_cuda()
+    transformers = _import_transformers()
+    dev = resolve_device(device)
+    root = Path(model_dir)
+    index = SafetensorsIndex(root)
+    config = transformers.AutoConfig.from_pretrained(root)
+    with skeleton.parameters_on_meta(torch):
+        model = transformers.AutoModelForTextEncoding.from_config(
+            config, dtype=skeleton.checkpoint_dtype(torch, index)
+        )
+    model.eval()
+
+    names = {id(module): name for name, module in model.named_modules()}
+    layers = find_blocks(model)
+    layers_name = names[id(layers)]
+    embedding = model.get_input_embeddings()
+    # T5 looks tokens up through a second module that holds the same parameter: every module
+    # that holds it gets the same table, and the checkpoint stores it under one of the names.
+    holders = [
+        module
+        for module in model.modules()
+        if any(param is embedding.weight for param in module._parameters.values())
+    ]
+    if not all(isinstance(module, torch.nn.Embedding) for module in holders):
+        kinds = sorted({type(module).__name__ for module in holders})
+        raise TypeError(
+            f"the token embedding of {type(model).__name__} is shared with {kinds}; this "
+            "adapter needs an encoder whose embedding is only looked up"
+        )
+    if any(names[id(module)].startswith(layers_name + ".") for module in holders):
+        raise ValueError("the embedding is inside the encoder blocks")
+    stored = [index.get(f"{names[id(module)]}.weight") for module in holders]
+    embedding_entry = next((entry for entry in stored if entry is not None), None)
+    if embedding_entry is None:
+        skeleton.require_entry(index, f"{names[id(embedding)]}.weight")  # raises, naming it
+
+    sources = [f"{layers_name}.{i}." for i in range(len(layers))]
+    ram_budget = None
+    if not keep_in_ram:
+        # Exactly the staging buffers: no block fits beside them, so all come from disk.
+        plans = FileWeights(index, sources).plan(torch, layers)
+        ram_budget = num_stage * max(plan.host_bytes for plan in plans)
+
+    undo: list[Any] = []
+    streamer = None
+    try:
+        table = skeleton.frozen(
+            torch, skeleton.checked_map(torch, embedding_entry, embedding.weight)
+        )
+        for module in holders:
+            _look_up_on_cpu(module, table, dev, undo)
+        skip = {id(m) for m in (*layers.modules(), *holders)}
+        resident_bytes = skeleton.make_resident(torch, model, index, dev, skip, undo)
+        weights = FileWeights(index, sources, ram_budget=ram_budget, num_stage=num_stage)
+        streamer = LayerStreamer(layers, slots=slots, device=dev, weights=weights)
+        original = type(model)
+        model.__class__ = skeleton.on_device_type(original, dev)
+        undo.append(functools.partial(setattr, model, "__class__", original))
+    except BaseException:
+        if streamer is not None:
+            streamer.close()
+        while undo:
+            undo.pop()()
+        raise
+    return StreamedModel(model, streamer, dev, [], resident_bytes, embedding_entry.nbytes, undo)
+
+
 # ---------------------------------------------------------------------------------------------
+
+
+def _look_up_on_cpu(embedding: Any, table: Any, device: Any, undo: list[Any]) -> None:
+    """Make ``embedding`` read its rows from ``table`` on the CPU and send them to ``device``.
+
+    ``table`` is the embedding memory-mapped from the file: ids come down to it, activations
+    go up, and the table itself never takes VRAM or page-locked RAM.
+    """
+    undo.append(functools.partial(skeleton.set_attribute, embedding, "weight", embedding.weight))
+    skeleton.set_attribute(embedding, "weight", table)
+    down = embedding.register_forward_pre_hook(skeleton.inputs_to_cpu, with_kwargs=True)
+    up = embedding.register_forward_hook(functools.partial(skeleton.output_to, device))
+    undo += [down.remove, up.remove]
 
 
 def _import_transformers() -> Any:
@@ -318,4 +436,6 @@ def _chunked_linear_type(torch: Any) -> Any:
     return ChunkedLinear
 
 
-__all__ = ["MIN_TRANSFORMERS", "StreamedModel", "head_rows", "load_causal_lm"]
+__all__ = [
+    "MIN_TRANSFORMERS", "StreamedModel", "head_rows", "load_causal_lm", "load_text_encoder",
+]  # fmt: skip
