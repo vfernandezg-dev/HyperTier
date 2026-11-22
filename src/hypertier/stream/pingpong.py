@@ -289,10 +289,10 @@ class LayerStreamer:
     RAM peaks near the model size plus one block), reserves ``slots`` VRAM buffers of the size
     of the largest block and installs forward hooks. The model itself is not rewritten: call
     it as usual, under ``torch.no_grad()`` or ``torch.inference_mode()``, with its inputs and
-    its non-streamed modules on ``device``. Before a block runs, its parameters are repointed
-    (``param.data``) to views of the slot holding its weights; afterwards they point back to
-    RAM, so ``state_dict()`` is always correct. See the module docstring for the streams and
-    events that order copies against compute.
+    its non-streamed modules on ``device``. Before a block runs, each of its parameters is
+    swapped for a ``Parameter`` that views the slot holding its weights; afterwards the
+    original one, whose data lives in RAM, is put back, so ``state_dict()`` is always correct.
+    See the module docstring for the streams and events that order copies against compute.
 
     Bytes moved per pass: every block that is not already in a slot, i.e. all the streamed
     weights once per pass when there are more blocks than slots, and nothing otherwise.
@@ -323,6 +323,10 @@ class LayerStreamer:
       not change between calls, and the hooks change it on every block.
     * Blocks must be distinct modules that share no parameters with each other, and a block
       must not return a view of its own weights (the slot is reused after it finishes).
+    * A module must reach its weights through its attributes (``self.weight``), as modules
+      do. One that keeps its own references to the ``Parameter`` objects would compute with
+      the copies in RAM; ``torch.nn`` RNNs do keep such a list, but refresh it when an
+      attribute is assigned, which is how their parameters are swapped.
     * A largest block far above the median wastes VRAM in every slot; a warning says so.
     """
 
@@ -373,7 +377,8 @@ class LayerStreamer:
         self._grad_flags: list[tuple[Any, bool]] = []
         self._moved_buffers: list[tuple[Any, str, Any]] = []
         self._slots: list[Any] = []
-        self._slot_views: list[list[list[Any]]] = []
+        self._bind: list[list[_Swap]] = []  # per slot, per block: its slot parameters
+        self._unbind: list[_Swap] = []  # per block: the parameters that live in RAM
         self._slot_dst: list[list[Any]] = []
         self._copy_stream: Any = None
         self._ready: list[Any] = []
@@ -467,7 +472,8 @@ class LayerStreamer:
         self._leased = True
 
         # One block at a time: assigning ``param.data`` drops the last reference to the
-        # original storage, so RAM never holds much more than the model plus one block.
+        # original storage, so RAM never holds much more than the model plus one block. The
+        # module keeps its own Parameter objects, now backed by the pool.
         for entries, size in zip(layouts, sizes):
             region = pool.alloc(size)
             params: list[Any] = []
@@ -491,9 +497,23 @@ class LayerStreamer:
         ]
         if largest and any(slot.data_ptr() % ALIGN for slot in self._slots):
             raise RuntimeError(f"VRAM slot is not {ALIGN}-byte aligned")
-        # Every (slot, block) view is made here, once: the hooks only assign them.
-        self._slot_views = [
-            [[_typed_view(slot, off, n, p) for p, off, n in entries] for entries in layouts]
+        # Every (slot, block) parameter is made here, once: the hooks only swap them in.
+        where = [_locations(block) for block in self._blocks]
+        self._unbind = [
+            _swap(torch, [(where[i][id(p)], p) for p, _, _ in entries])
+            for i, entries in enumerate(layouts)
+        ]
+        self._bind = [
+            [
+                _swap(
+                    torch,
+                    [
+                        (where[i][id(p)], _slot_parameter(torch, slot, off, n, p))
+                        for p, off, n in entries
+                    ],
+                )
+                for i, entries in enumerate(layouts)
+            ]
             for slot in self._slots
         ]
         self._slot_dst = [[slot[:size] for size in sizes] for slot in self._slots]
@@ -564,7 +584,7 @@ class LayerStreamer:
                 module._buffers[key] = buf.to(device)
         for state in (
             self._grad_flags, self._moved_buffers, self._params, self._host_views,
-            self._regions, self._slots, self._slot_views, self._slot_dst, self._ready,
+            self._regions, self._slots, self._bind, self._unbind, self._slot_dst, self._ready,
             self._free,
         ):
             state.clear()
@@ -603,8 +623,7 @@ class LayerStreamer:
             record.compute.append(timing)
         else:
             compute.wait_event(self._ready[slot])
-        for param, view in zip(self._params[index], self._slot_views[slot][index]):
-            param.data = view
+        _apply(self._bind[slot][index])
         self._running[index] = [1, slot, timing]
 
     def _exit(self, index: int, module: Any, args: Any, output: Any) -> None:
@@ -621,8 +640,7 @@ class LayerStreamer:
             timing[2] = self._events.record(compute)
         # Every kernel of the block is enqueued by now: the slot is free once they finish.
         self._free[slot].record(compute)
-        for param, view in zip(self._params[index], self._host_views[index]):
-            param.data = view
+        _apply(self._unbind[index])
         self._table.exit(index)
 
     def _copy(self, load: Load) -> None:
@@ -729,3 +747,49 @@ def _plan_layout(
 def _typed_view(buffer: Any, offset: int, nbytes: int, like: Any) -> Any:
     """``nbytes`` of a uint8 buffer seen as a tensor with ``like``'s dtype and shape."""
     return buffer[offset : offset + nbytes].view(like.dtype).view(like.shape)
+
+
+def _slot_parameter(torch: Any, slot: Any, offset: int, nbytes: int, like: Any) -> Any:
+    """A frozen Parameter over the bytes of a VRAM slot where ``like``'s weights land."""
+    return torch.nn.Parameter(_typed_view(slot, offset, nbytes, like), requires_grad=False)
+
+
+# Binding a block's weights means putting other Parameter objects in its modules, not changing
+# ``param.data``: a parameter can then be anything, including a ``meta`` placeholder with no
+# memory, which ``param.data`` cannot switch to or from.
+_Swap = tuple[list[tuple[dict[str, Any], str, Any]], list[tuple[Any, str, Any]]]
+
+
+def _locations(block: Any) -> dict[int, list[tuple[Any, str]]]:
+    """For every parameter of ``block``, each (module, attribute name) that holds it."""
+    found: dict[int, list[tuple[Any, str]]] = {}
+    for module in block.modules():
+        for name, param in module._parameters.items():
+            if param is not None:
+                found.setdefault(id(param), []).append((module, name))
+    return found
+
+
+def _swap(torch: Any, placements: list[tuple[list[tuple[Any, str]], Any]]) -> _Swap:
+    """Precompute how to install ``param`` at every place of ``placements``.
+
+    Most modules take a direct write to ``_parameters``. A class that overrides
+    ``__setattr__`` does so to track its parameters (``torch.nn`` RNNs keep a flat list of
+    them), so those are assigned through it.
+    """
+    direct: list[tuple[dict[str, Any], str, Any]] = []
+    through_setattr: list[tuple[Any, str, Any]] = []
+    for places, param in placements:
+        for module, name in places:
+            if type(module).__setattr__ is torch.nn.Module.__setattr__:
+                direct.append((module._parameters, name, param))
+            else:
+                through_setattr.append((module, name, param))
+    return direct, through_setattr
+
+
+def _apply(swap: _Swap) -> None:
+    for parameters, name, param in swap[0]:
+        parameters[name] = param
+    for module, name, param in swap[1]:
+        setattr(module, name, param)
