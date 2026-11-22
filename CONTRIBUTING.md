@@ -8,12 +8,13 @@ Thanks for your interest! HyperTier is in early development, so the most valuabl
 
 ## Development setup
 
+HyperTier targets native Linux with an NVIDIA GPU (only the driver is needed, not the CUDA Toolkit).
+
 ```bash
 git clone https://github.com/vfernandezg-dev/HyperTier.git
 cd HyperTier
-python -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+bash scripts/setup.sh            # apt deps, .venv, torch + triton, GPU check, tests
+source .venv/bin/activate
 pytest
 ruff check .
 ```

@@ -9,7 +9,8 @@ HyperTier is an open-source **tiered-memory inference runtime** (Python + PyTorc
 Goal: run very large models (15 GB → 400 GB+) on consumer GPUs with **4 GB of VRAM** by treating
 VRAM as the fastest tier of `VRAM ◄ pinned RAM ◄ NVMe` and moving weights, experts and caches just
 in time, overlapped with compute. Modality-agnostic: LLMs/MoE, video & image diffusion (DiT), multimodal.
-Reference hardware: **RTX 3050 Laptop (4 GB, Ampere sm_86) + 32 GB RAM + NVMe**, Linux/WSL2.
+Reference hardware: **RTX 3050 Laptop (4 GB, Ampere sm_86) + 32 GB RAM + NVMe**, native Linux
+(Ubuntu 26.04, NVIDIA driver 595, system Python 3.14).
 
 ## Status
 
@@ -24,8 +25,8 @@ Reference hardware: **RTX 3050 Laptop (4 GB, Ampere sm_86) + 32 GB RAM + NVMe**,
 ## Commands
 
 ```bash
-# one-time setup inside WSL2/Ubuntu (clones to ~/dev/HyperTier, installs torch+triton, verifies GPU)
-bash scripts/setup_wsl.sh
+# one-time setup on native Linux (apt deps, .venv, torch+triton, verifies GPU, runs tests)
+bash scripts/setup.sh
 source .venv/bin/activate
 
 pytest -q                       # tests
@@ -35,8 +36,7 @@ ruff check .                    # lint (line length 100, target py310)
 python -m build                 # build sdist + wheel
 ```
 
-Work from the Linux filesystem (`~/dev/HyperTier`), not `/mnt/d/...`: Windows-drive I/O from WSL is
-much slower and distorts NVMe benchmarks.
+No CUDA Toolkit is needed: PyTorch wheels ship their own CUDA libraries; only the NVIDIA driver is.
 
 ## Repository layout (target)
 
@@ -75,7 +75,8 @@ Create modules only when the current phase needs them.
    Do not compress activations in the compute path; use chunking/tiling (exact) instead.
 6. **Triton first, PyTorch fallback.** Kernels must also run under `TRITON_INTERPRET=1` and be
    tested bit-exact (or within tolerance) against a pure-PyTorch reference.
-7. **Linux/WSL2 first.** Native Windows only through the PyTorch fallback.
+7. **Native Linux first.** WSL2 and Windows are not targeted; Windows only through the PyTorch
+   fallback. Telemetry still detects WSL (`is_wsl()`) so foreign results are labelled, not trusted.
 
 ## Coding conventions
 
