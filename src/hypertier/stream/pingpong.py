@@ -200,11 +200,12 @@ class SlotTable:
 class PassStats:
     """One pass over the blocks, timed with CUDA events on the device timeline.
 
-    The times are measured while copies and compute overlap. If a copy in flight slows the
-    kernels down (as on WSL2, issue #1), that slowdown is inside ``compute_ms`` and
-    ``efficiency`` does not show it: it reports how much of the shorter side the pipeline hid,
-    not what the hardware lost to contention. For the end-to-end figure, compare ``total_ms``
-    with the same pass on a model that is fully resident in VRAM.
+    ``efficiency`` is an upper bound. The times are taken while copies and compute overlap,
+    so when a copy in flight slows the kernels down (a few percent on native Linux, far more
+    on WSL2: issue #1), that slowdown is inside ``compute_ms`` and the figure cannot see it:
+    it only says how much of the shorter side the pipeline scheduled behind the longer one.
+    The metric to trust is the one ``benchmarks/bench_streaming.py`` reports, which compares
+    the streamed pass with the same pass on a model that is fully resident in VRAM.
     """
 
     blocks: int  # block forwards in the pass
@@ -215,7 +216,8 @@ class PassStats:
     compute_ms: float  # sum of the block forwards (compute stream)
     stall_ms: float  # time the compute stream waited for a slot to be ready
     total_ms: float  # first block reached -> last block or last copy finished
-    efficiency: float | None  # overlap_efficiency(copy, compute, total); None without copies
+    # overlap_efficiency(copy, compute, total): an upper bound (see above); None without copies
+    efficiency: float | None
 
 
 @dataclass
