@@ -65,6 +65,19 @@ def test_alloc_returns_aligned_contiguous_pinned_views():
 
 
 @pytest.mark.cuda
+def test_alloc_can_start_on_a_page_for_direct_reads():
+    with PinnedPool(0, segment_bytes=MiB) as pool:
+        pool.alloc(100)
+        page = pool.alloc(3 * PAGE, align=PAGE)  # O_DIRECT needs a block-aligned address
+        assert page.data_ptr() % PAGE == 0 and page.is_pinned()
+        assert pool.used_bytes == 4 * PAGE
+        assert pool.alloc(10).data_ptr() == page.data_ptr() + 3 * PAGE
+        for bad in (100, 768, 2 * PAGE):
+            with pytest.raises(ValueError, match="align"):
+                pool.alloc(16, align=bad)
+
+
+@pytest.mark.cuda
 def test_capacity_is_locked_at_its_exact_size():
     odd = MiB + 5000  # not a power of two, not even a whole number of pages
     with PinnedPool(2 * MiB + odd, segment_bytes=2 * MiB) as pool:
