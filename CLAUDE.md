@@ -11,8 +11,11 @@ VRAM as the fastest tier of `VRAM ◄ pinned RAM ◄ NVMe` and moving weights, e
 in time, overlapped with compute. Modality-agnostic: LLMs/MoE, video & image diffusion (DiT), multimodal.
 Reference hardware: **RTX 3050 Laptop (4 GB, Ampere sm_86) + 32 GB RAM + NVMe** (Lenovo Legion 5,
 Ryzen 7 5800H, PCIe Gen3 x8), native Linux: Ubuntu 26.04, NVIDIA driver 595, system Python 3.14.
-Measured there (`bench_hw`): H2D/D2H pinned ≈ 6.6 GB/s, NVMe O_DIRECT read ≈ 3.0 GB/s, pinned RAM
-up to 21 GiB, copy/compute overlap ≈ 0.97.
+BIOS: hybrid GPU mode (desktop on the Radeon iGPU, PRIME on-demand) with a 1 GiB iGPU frame buffer,
+so the RTX 3050 is free for compute. If VRAM free drops to ~2.8 GiB, the MUX was switched back to
+discrete (e.g. by Lenovo Vantage in the Windows dual boot); fix it before benchmarking.
+Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NVMe O_DIRECT read
+≈ 3.0 GB/s, pinned RAM up to 20.8 GiB, copy/compute overlap ≈ 1.0.
 
 ## Status
 
