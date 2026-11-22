@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any
 
-from hypertier.stream.pinned import ALIGN, PinnedPool, align_up, pow2_ceil
+from hypertier.stream.pinned import ALIGN, PinnedPool, align_up
 from hypertier.telemetry._common import (
     MiB,
     format_bytes,
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
 _OVERSIZE_RATIO = 1.5  # warn when the largest block exceeds this many times the median
-_MIN_PRIVATE_SEGMENT = 16 * MiB  # tiny models: do not pin one segment per tiny block
+_MIN_PRIVATE_SEGMENT = MiB  # tiny models: do not lock one segment per tiny block
 _MAX_PENDING_PASSES = 64  # telemetry of passes the GPU has not finished yet
 _HISTORY_PASSES = 1024
 
@@ -418,8 +418,9 @@ class LayerStreamer:
         Waits for the copy stream and for the kernels still reading the slots before anything
         is released. Afterwards the parameters are ordinary CPU tensors with their original
         ``requires_grad``, and buffers are back on the device they came from. With a private
-        pool the parameters keep living in its page-locked memory, without a copy; with a
-        caller's pool they are copied to pageable memory, so the pool can be reset for the
+        pool the parameters stay where they are, without a copy: the pool is closed, which
+        unlocks its pages, and the memory is freed with the last parameter that uses it. With
+        a caller's pool they are copied to pageable memory, so the pool can be reset for the
         next model.
         """
         if self._closed:
@@ -459,7 +460,8 @@ class LayerStreamer:
         self.streamed_bytes = sum(sizes)
 
         if pool is None:
-            pool = PinnedPool(0, segment_bytes=max(pow2_ceil(largest), _MIN_PRIVATE_SEGMENT))
+            # Grows by one block at a time, each segment exactly as large as its block.
+            pool = PinnedPool(0, segment_bytes=_MIN_PRIVATE_SEGMENT)
         pool._attach()
         self._pool = pool
         self._leased = True
@@ -570,6 +572,9 @@ class LayerStreamer:
         if self._leased and self._pool is not None:
             self._pool._detach()
             self._leased = False
+            if self._owns_pool:
+                # Unlocks the pages; the parameters keep the memory itself alive.
+                self._pool.close()
         self._pool = None
 
     # -----------------------------------------------------------------------------------------

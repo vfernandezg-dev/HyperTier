@@ -3,18 +3,27 @@
 
 """Tests for hypertier.stream.pinned (the page-locked RAM pool)."""
 
+import gc
+import mmap
+
 import pytest
 
-from hypertier.stream.pinned import ALIGN, PinnedPool, align_up, pow2_ceil
-from hypertier.telemetry import KiB, MiB
+from hypertier.stream.pinned import ALIGN, PinnedPool, align_up
+from hypertier.telemetry import KiB, MiB, read_meminfo
+
+PAGE = mmap.PAGESIZE
 
 
-def test_align_up_and_pow2_ceil():
+def ram_in_use() -> int:
+    """Anonymous plus shared memory, system-wide; MemAvailable lags after memory is freed."""
+    info = read_meminfo()
+    return info["AnonPages"] + info["Shmem"]
+
+
+def test_align_up():
     assert [align_up(n) for n in (0, 1, 255, 256, 257)] == [0, 256, 256, 256, 512]
     assert align_up(10, 4) == 12
-    assert [pow2_ceil(n) for n in (0, 1, 2, 3, 4, 5, 1023, 1024, 1025)] == [
-        1, 1, 2, 4, 4, 8, 1024, 1024, 2048,
-    ]
+    assert align_up(PAGE + 1, PAGE) == 2 * PAGE
 
 
 def test_pool_needs_cuda(monkeypatch):
@@ -29,7 +38,7 @@ def test_pool_needs_cuda(monkeypatch):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize(("capacity", "segment"), [(-1, MiB), (0, 3 * MiB), (0, 128)])
+@pytest.mark.parametrize(("capacity", "segment"), [(-1, MiB), (0, 0), (0, -PAGE)])
 def test_pool_validates_sizes(capacity, segment):
     with pytest.raises(ValueError):
         PinnedPool(capacity, segment_bytes=segment)
@@ -54,26 +63,27 @@ def test_alloc_returns_aligned_contiguous_pinned_views():
 
 
 @pytest.mark.cuda
-def test_initial_capacity_is_pinned_in_power_of_two_segments():
-    with PinnedPool(3 * MiB, segment_bytes=2 * MiB) as pool:
-        assert pool.capacity_bytes == 3 * MiB  # 2 MiB + 1 MiB
+def test_capacity_is_locked_at_its_exact_size():
+    odd = MiB + 5000  # not a power of two, not even a whole number of pages
+    with PinnedPool(2 * MiB + odd, segment_bytes=2 * MiB) as pool:
+        assert pool.capacity_bytes == 2 * MiB + align_up(odd, PAGE)
         assert pool.pin_seconds > 0
         pinned = pool.pin_seconds
         pool.alloc(2 * MiB)
-        pool.alloc(MiB)
+        pool.alloc(odd)
         assert pool.pin_seconds == pinned, "requests that fit must not pin anything"
 
 
 @pytest.mark.cuda
 def test_pool_grows_instead_of_failing():
     with PinnedPool(0, segment_bytes=MiB) as pool:
-        big = pool.alloc(3 * MiB)  # larger than a segment: gets one big enough for it
-        assert big.numel() == 3 * MiB and big.is_pinned()
-        assert pool.capacity_bytes == 4 * MiB
-        pool.alloc(MiB)  # fits in the tail of the big segment
-        assert pool.capacity_bytes == 4 * MiB
+        big = pool.alloc(3 * MiB + 100)  # larger than a segment: gets one of exactly its size
+        assert big.numel() == 3 * MiB + 100 and big.is_pinned()
+        assert pool.capacity_bytes == 3 * MiB + PAGE
+        pool.alloc(2 * KiB)  # fits in what the page rounding left over
+        assert pool.capacity_bytes == 3 * MiB + PAGE
         pool.alloc(MiB)  # no room left anywhere: one more regular segment
-        assert pool.capacity_bytes == 5 * MiB
+        assert pool.capacity_bytes == 4 * MiB + PAGE
 
 
 @pytest.mark.cuda
@@ -108,10 +118,70 @@ def test_reset_waits_for_copies_still_reading_the_pool():
 
 
 @pytest.mark.cuda
-def test_closed_pool_refuses_requests():
-    pool = PinnedPool(MiB, segment_bytes=MiB)
+def test_close_unlocks_the_pages_and_views_stay_valid_until_dropped():
+    size = 64 * MiB + 5 * PAGE
+    PinnedPool(PAGE).close()  # CUDA and the registration path allocate on first use
+    gc.collect()
+    base = ram_in_use()
+    pool = PinnedPool(size)
+    view = pool.alloc(size)
+    view.fill_(7)
+    assert view.is_pinned()
+    assert pool.capacity_bytes == size
+    assert abs(ram_in_use() - base - size) <= 16 * MiB, "locked more (or less) than asked"
+
     pool.close()
     pool.close()  # idempotent
     assert pool.capacity_bytes == 0
     with pytest.raises(RuntimeError):
         pool.alloc(16)
+    gc.collect()
+    assert not view.is_pinned()
+    assert int(view.min()) == 7 == int(view.max()), "the memory must outlive the pool"
+    view.fill_(9)  # still writable, ordinary memory
+
+    del view
+    gc.collect()
+    assert ram_in_use() - base <= 16 * MiB, "the mapping must go away with its last tensor"
+
+
+@pytest.mark.cuda
+def test_pool_dropped_without_close_unlocks_its_pages():
+    pool = PinnedPool(0, segment_bytes=MiB)
+    view = pool.alloc(1000)
+    view.fill_(3)
+    assert view.is_pinned()
+    del pool
+    gc.collect()
+    assert not view.is_pinned()
+    assert int(view.max()) == 3
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("failure", ["binding missing", "registration refused"])
+def test_falls_back_to_the_pytorch_pinned_allocator_with_a_warning(monkeypatch, failure):
+    import torch
+
+    class Refuses:
+        def cudaHostRegister(self, *args):  # same names as the CUDA runtime binding
+            return 2  # cudaErrorMemoryAllocation
+
+        def cudaHostUnregister(self, *args):
+            raise AssertionError("nothing was registered")
+
+    def missing():
+        raise AttributeError("this PyTorch has no cudart binding")
+
+    monkeypatch.setattr(torch.cuda, "cudart", missing if failure == "binding missing" else Refuses)
+    with pytest.warns(UserWarning, match="cudaHostRegister.*falling back"):
+        pool = PinnedPool(MiB)
+    with pool:
+        view = pool.alloc(300 * KiB)
+        view.fill_(5)
+        assert view.is_pinned() and view.data_ptr() % ALIGN == 0
+        dst = torch.empty(300 * KiB, dtype=torch.uint8, device="cuda")
+        dst.copy_(view, non_blocking=True)
+        assert int(dst.min()) == 5 == int(dst.max())
+        with pytest.warns(UserWarning, match="falling back"):
+            pool.alloc(2 * MiB)  # growing takes the same path
+    assert int(view.max()) == 5, "views must survive the pool here too"

@@ -83,6 +83,9 @@ Create modules only when the current phase needs them.
    block counts + cyclic prefetch), and LRU never evicts a block of the current prefetch window
    (plain LRU drops pending prefetches from 4 slots up). CUDA events: `slot_ready` (compute waits
    copy), `slot_free` (copy waits compute). Every parameter is aligned to 256 B in RAM and VRAM.
+   Weights wait in a `PinnedPool`: `mmap` memory locked with `cudaHostRegister` at its exact size
+   (≈ 1.8 GB/s; 20 GiB verified, `RLIMIT_MEMLOCK` and `/dev/shm` do not limit it). PyTorch's
+   pinned allocator rounds up to a power of two and is only the fallback.
    A slot is as large as the biggest block, so oversized blocks waste VRAM in every slot
    (`LayerStreamer` warns above 1.5x the median). Planned for the F1 Hugging Face adapter, not
    implemented yet: keep the token embedding on the CPU and split `lm_head` by vocabulary.

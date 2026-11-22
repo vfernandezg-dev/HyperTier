@@ -10,6 +10,7 @@ VRAM, and VRAM, RAM and overlap are measured on the device.
 
 import copy
 import gc
+import mmap
 import subprocess
 import sys
 import threading
@@ -501,35 +502,33 @@ def test_copies_hide_behind_compute_when_blocks_are_compute_bound():
 
 
 @pytest.mark.cuda
-def test_build_keeps_ram_near_the_model_plus_one_block():
+def test_build_keeps_ram_at_the_model_plus_one_block():
     import torch
 
-    from hypertier.telemetry.bandwidth import release_pinned_cache
-
-    # CUDA, the copy stream and the pinned allocator allocate host memory on first use.
+    # CUDA, the copy stream and page-locking allocate host memory on first use.
     with LayerStreamer(toy_mlp(2, 64).blocks):
         pass
-    # Bias-free blocks are exactly 64 MiB. PyTorch's pinned allocator rounds every segment up
-    # to a power of two, so any other size would measure that rounding, not the build order.
-    model = toy_mlp(7, 4096, bias=False, dtype="float16")
-    block = 2 * 4096 * 4096 * 2
+    # Realistic blocks: biases and a width that is no power of two (61.05 MiB each).
+    model = toy_mlp(7, 4000, dtype="float16")
+    weights = sum(p.numel() * p.element_size() for p in model.parameters())
     corner = model.blocks[6].fc2.weight[:8, :8].clone()
     gc.collect()
-    release_pinned_cache()
     with RamSampler() as ram:  # the model is already in RAM: this measures the extra
         streamer = LayerStreamer(model.blocks)
     extra = ram.highest - ram.start
+    block = streamer.slot_bytes
+    pinned = streamer._pool.capacity_bytes
     print(
-        f"\n[stream] build of 7 x {block / MiB:.0f} MiB: RAM in use peaked {extra / MiB:.0f} MiB "
-        f"above the model (one block = {block / MiB:.0f} MiB) and ended "
-        f"{(ram_in_use() - ram.start) / MiB:+.0f} MiB; pool "
-        f"{streamer._pool.capacity_bytes / MiB:.0f} MiB pinned in "
+        f"\n[stream] build of 7 x {block / MiB:.2f} MiB: RAM in use peaked {extra / MiB:.1f} MiB "
+        f"above the model and ended {(ram_in_use() - ram.start) / MiB:+.1f} MiB; pool "
+        f"{pinned / MiB:.2f} MiB locked for {weights / MiB:.2f} MiB of weights in "
         f"{streamer._pool.pin_seconds:.2f} s"
     )
-    assert streamer.slot_bytes == block
+    assert block % (1 << 20) != 0 and block > weights // 7
     assert torch.equal(model.blocks[6].fc2.weight[:8, :8], corner)
+    assert 0 <= pinned - streamer.streamed_bytes < 7 * mmap.PAGESIZE, "locked more than needed"
     streamer.close()
-    assert extra <= block + 32 * MiB
+    assert extra <= block + 16 * MiB  # one block, plus slack for what else the system does
 
 
 @pytest.mark.cuda
@@ -553,6 +552,8 @@ def test_close_leaves_a_valid_cpu_model():
     streamer.close()  # idempotent
     assert torch.equal(out, expected)
 
+    gc.collect()  # the private pool is gone: only the parameters keep its memory alive
+    assert not any(p.is_pinned() for p in model.blocks.parameters()), "pages must be unlocked"
     after = model.state_dict()
     assert after.keys() == before.keys()
     assert all(torch.equal(after[name].cpu(), value) for name, value in before.items())
@@ -595,6 +596,31 @@ def test_pool_is_reused_by_a_second_model():
 
     state = first.state_dict()  # not overwritten by the model that took over the pool
     assert all(torch.equal(state[name].cpu(), value) for name, value in first_weights.items())
+
+
+@pytest.mark.cuda
+def test_streaming_works_on_the_pinned_allocator_fallback(monkeypatch):
+    import torch
+
+    def missing():
+        raise AttributeError("this PyTorch has no cudart binding")
+
+    model = toy_transformer(7)
+    before = {name: value.clone() for name, value in model.state_dict().items()}
+    x = torch.randn(2, 9, 100, device="cuda")
+    expected = resident_outputs(model, x, passes=2)
+    model.norm.cuda()
+    monkeypatch.setattr(torch.cuda, "cudart", missing)
+    with pytest.warns(UserWarning, match="cudaHostRegister.*falling back"):
+        streamer = LayerStreamer(model.blocks)
+    with streamer, torch.no_grad():
+        assert all(p.is_pinned() for p in model.blocks.parameters())
+        y = x
+        for want in expected:
+            y = model(y)
+            assert torch.equal(y, want)
+    after = model.state_dict()
+    assert all(torch.equal(after[name].cpu(), value) for name, value in before.items())
 
 
 @pytest.mark.cuda
