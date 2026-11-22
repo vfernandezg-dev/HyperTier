@@ -407,13 +407,13 @@ def run_phase(name: str, fn: Callable[[], Any], payload: dict[str, Any], gpu: bo
     payload["durations_s"][name] = round(time.perf_counter() - t0, 3)
 
 
-def write_results(payload: dict[str, Any], out_dir: Path) -> Path:
+def write_results(payload: dict[str, Any], out_dir: Path, prefix: str = "hw") -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = out_dir / f"hw_{stamp}.json"
+    path = out_dir / f"{prefix}_{stamp}.json"
     suffix = 1
     while path.exists():
-        path = out_dir / f"hw_{stamp}_{suffix}.json"
+        path = out_dir / f"{prefix}_{stamp}_{suffix}.json"
         suffix += 1
     path.write_text(json.dumps(payload, indent=2) + "\n")
     return path
