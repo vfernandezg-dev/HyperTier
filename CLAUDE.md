@@ -26,7 +26,7 @@ Reference hardware: **RTX 3050 Laptop (4 GB, Ampere sm_86) + 32 GB RAM + NVMe**,
 
 ```bash
 # one-time setup on native Linux (apt deps, .venv, torch+triton, verifies GPU, runs tests)
-bash scripts/setup.sh
+bash scripts/setup_linux.sh
 source .venv/bin/activate
 
 pytest -q                       # tests

@@ -858,7 +858,7 @@ class NvmeReport:
 
 
 def measure_nvme_read(
-    directory: str | os.PathLike[str] = "~/dev",
+    directory: str | os.PathLike[str] = "~",
     *,
     file_bytes: int = 4 * GiB,
     chunk_sizes: Sequence[int] = (4 * MiB, 16 * MiB, 64 * MiB),
@@ -883,7 +883,7 @@ def measure_nvme_read(
     if is_wsl() and _is_under_mnt(root) and not allow_windows_mount:
         raise ValueError(
             f"{root} is under /mnt (a Windows drive reached through 9P on WSL); "
-            "use a Linux-filesystem path such as ~/dev"
+            "use a Linux-filesystem path such as ~ (your home)"
         )
     if not root.is_dir():
         raise FileNotFoundError(f"directory not found: {root}")

@@ -2,14 +2,17 @@
 # Copyright 2026 The HyperTier Authors
 # SPDX-License-Identifier: Apache-2.0
 #
-# HyperTier — one-shot development environment setup for native Linux (Ubuntu/Debian) + NVIDIA GPU.
+# HyperTier — one-shot environment setup for Linux (Ubuntu/Debian) + NVIDIA GPU.
 #
 # Usage (from anywhere inside the repository):
-#   bash scripts/setup.sh
+#   bash scripts/setup_linux.sh
 #
 # Works on the repository the script lives in (no cloning), creates .venv with the system
 # python3, installs PyTorch + Triton + dev tools, and verifies that CUDA, pinned memory and a
 # Triton kernel actually work on the GPU. Safe to re-run.
+#
+# Native Linux is the development and benchmark platform. WSL2 is still supported for users:
+# it is detected and gets WSL-specific advice (driver lives on Windows, RAM limit, /mnt I/O).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,17 +23,34 @@ fail() { printf '\033[1;31m[x] %s\033[0m\n' "$*"; exit 1; }
 
 # ---------------------------------------------------------------------------
 step "1/6  Checking OS, NVIDIA driver and memory"
-[ "$(uname -s)" = "Linux" ] || fail "HyperTier targets native Linux; this is $(uname -s)."
+[ "$(uname -s)" = "Linux" ] || fail "HyperTier needs Linux (native or WSL2); this is $(uname -s)."
+IS_WSL=0
 if grep -qi microsoft /proc/version; then
-  warn "WSL detected. This script targets native Linux; WSL is not supported or tested."
+  IS_WSL=1
+  warn "WSL2 detected. Supported, but copy/compute overlap is lower than on native Linux
+    (~0.7 vs ~0.95, measured by benchmarks/bench_hw.py); expect slower streaming."
 fi
-command -v nvidia-smi >/dev/null 2>&1 || fail "nvidia-smi not found: the NVIDIA driver is missing.
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  if [ "$IS_WSL" -eq 1 ]; then
+    fail "nvidia-smi not found inside WSL.
+    Fix: update the NVIDIA driver on *Windows* (do NOT install any NVIDIA driver inside WSL),
+    then run 'wsl --shutdown' in PowerShell and open the distro again."
+  fi
+  fail "nvidia-smi not found: the NVIDIA driver is missing.
     Fix (Ubuntu): sudo ubuntu-drivers install   then reboot and re-run this script.
     No CUDA Toolkit is needed; PyTorch wheels ship their own CUDA libraries."
+fi
 nvidia-smi --query-gpu=name,driver_version,memory.total,memory.used --format=csv
 MEM_GB=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo)
 echo "System RAM: ${MEM_GB} GB"
-[ "$MEM_GB" -ge 16 ] || warn "Only ${MEM_GB} GB of RAM; the pinned-RAM tier will be small."
+if [ "$MEM_GB" -lt 20 ] && [ "$IS_WSL" -eq 1 ]; then
+  warn "WSL only sees ${MEM_GB} GB of RAM. Raise it in C:\\Users\\<you>\\.wslconfig:
+        [wsl2]
+        memory=24GB
+    then run 'wsl --shutdown' in PowerShell."
+elif [ "$MEM_GB" -lt 16 ]; then
+  warn "Only ${MEM_GB} GB of RAM; the pinned-RAM tier will be small."
+fi
 
 # ---------------------------------------------------------------------------
 step "2/6  Checking system packages"
@@ -53,6 +73,10 @@ echo "Using $(python3 --version) from $(command -v python3)"
 
 # ---------------------------------------------------------------------------
 step "3/6  Repository: $REPO_ROOT"
+if [ "$IS_WSL" -eq 1 ] && [[ "$REPO_ROOT" == /mnt/* ]]; then
+  warn "Repo is on a Windows drive (/mnt/...): disk I/O through 9P is much slower and distorts
+    NVMe benchmarks. Clone it under ~ instead."
+fi
 cd "$REPO_ROOT"
 [ -f pyproject.toml ] || fail "pyproject.toml not found in $REPO_ROOT; run the script from the repo."
 
@@ -79,13 +103,14 @@ print(f"Python  {sys.version.split()[0]}")
 print(f"PyTorch {torch.__version__}  (built for CUDA {torch.version.cuda})")
 if not torch.cuda.is_available():
     sys.exit("[x] torch.cuda.is_available() is False. Check 'nvidia-smi'; this PyTorch build may "
-             "need a newer NVIDIA driver (sudo ubuntu-drivers install, then reboot).")
+             "need a newer NVIDIA driver (native: sudo ubuntu-drivers install, then reboot; "
+             "WSL2: update the driver on Windows, then 'wsl --shutdown').")
 props = torch.cuda.get_device_properties(0)
 free, total = torch.cuda.mem_get_info()
 print(f"GPU     {props.name}  (sm_{props.major}{props.minor}, {props.multi_processor_count} SMs)")
 print(f"VRAM    {free/2**30:.2f} GiB free / {total/2**30:.2f} GiB total")
 
-# Pinned (page-locked) host memory: HyperTier's RAM tier depends on it.
+# Pinned (page-locked) host memory: HyperTier's RAM tier depends on it (WSL2 can restrict it).
 try:
     buf = torch.empty(512 * 2**20, dtype=torch.uint8).pin_memory()
     print(f"Pinned  512 MiB allocation OK (is_pinned={buf.is_pinned()})")

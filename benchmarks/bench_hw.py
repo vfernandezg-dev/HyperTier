@@ -8,7 +8,7 @@ fp16/bf16 matmul throughput, NVMe sequential reads into pinned memory and the la
 allocation the OS allows. Everything, plus the metadata needed to reproduce the run, goes to
 ``benchmarks/results/hw_<UTC timestamp>.json``; a summary table is printed.
 
-    python benchmarks/bench_hw.py            # full profile: ~2 min, ~4.3 GiB free in ~/dev
+    python benchmarks/bench_hw.py            # full profile: ~2 min, ~4.3 GiB free in ~
     python benchmarks/bench_hw.py --quick    # tiny sizes, smoke test
 """
 
@@ -67,7 +67,7 @@ class Config:
     matmul_sizes: tuple[int, ...] = (1024, 2048, 4096, 8192)
     matmul_repeats: int = 10
     device_copy_bytes: int = 256 * MiB
-    nvme_dir: str = "~/dev"
+    nvme_dir: str = "~"
     nvme_file_bytes: int = 4 * GiB
     nvme_chunks: tuple[int, ...] = (4 * MiB, 16 * MiB, 64 * MiB)
     pinned_cap_bytes: int = 16 * GiB
@@ -105,7 +105,7 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--nvme-dir", help="directory on the disk to test; must be a Linux path, not /mnt/ "
-        "(default: ~/dev)",
+        "(default: ~)",
     )
     parser.add_argument("--nvme-file-gib", type=float, help="NVMe test file size (default 4)")
     parser.add_argument("--max-copy-mib", type=int, help="largest RAM<->VRAM copy (default 1024)")

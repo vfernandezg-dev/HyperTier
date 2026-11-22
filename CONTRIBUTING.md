@@ -13,7 +13,7 @@ HyperTier targets native Linux with an NVIDIA GPU (only the driver is needed, no
 ```bash
 git clone https://github.com/vfernandezg-dev/HyperTier.git
 cd HyperTier
-bash scripts/setup.sh            # apt deps, .venv, torch + triton, GPU check, tests
+bash scripts/setup_linux.sh            # apt deps, .venv, torch + triton, GPU check, tests
 source .venv/bin/activate
 pytest
 ruff check .
