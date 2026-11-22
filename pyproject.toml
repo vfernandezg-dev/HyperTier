@@ -36,11 +36,15 @@ dependencies = []
 [project.optional-dependencies]
 # Hugging Face adapter (hypertier.adapters). 5.24 is the oldest release it is tested with.
 hf = ["transformers>=5.24"]
+# Diffusion adapter (hypertier.adapters.hf_diffusers). 0.43 is the oldest release it is tested
+# with. transformers is for the text encoder, and ftfy cleans prompts as the pipelines of
+# diffusers do: without it the same prompt gives other tokens.
+diffusers = ["diffusers>=0.43", "transformers>=5.24", "ftfy"]
 dev = ["pytest>=8", "ruff>=0.6", "build", "twine"]
 # What the model tests and bench_llm need on a machine with a GPU, besides torch. accelerate
 # is only a baseline to compare against: nothing in the package imports it. CI installs
 # "dev" alone and skips these tests.
-test = ["transformers>=5.24", "accelerate>=1.16"]
+test = ["transformers>=5.24", "accelerate>=1.16", "diffusers>=0.43", "ftfy"]
 
 [project.urls]
 Homepage = "https://github.com/vfernandezg-dev/HyperTier"
