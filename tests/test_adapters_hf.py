@@ -14,6 +14,7 @@ from itertools import pairwise
 import pytest
 from toys import tiny_causal_lm
 
+from hypertier.adapters import _skeleton as skeleton
 from hypertier.adapters import hf_transformers as hf
 from hypertier.adapters import load_causal_lm
 
@@ -60,9 +61,9 @@ def test_importing_the_adapter_imports_neither_torch_nor_transformers():
 
 
 def test_versions_are_compared_by_their_leading_numbers():
-    assert hf._version("5.24.0") == (5, 24, 0)
-    assert hf._version("5.25.0.dev0") == (5, 25, 0)
-    assert hf._version("4.57.6") < hf.MIN_TRANSFORMERS <= hf._version("5.24.0")
+    assert skeleton.version_tuple("5.24.0") == (5, 24, 0)
+    assert skeleton.version_tuple("5.25.0.dev0") == (5, 25, 0)
+    assert skeleton.version_tuple("4.57.6") < hf.MIN_TRANSFORMERS <= skeleton.version_tuple("5.24.0")
 
 
 # ---------------------------------------------------------------------------------------------
