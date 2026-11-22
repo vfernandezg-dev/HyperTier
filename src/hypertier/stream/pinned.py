@@ -70,7 +70,7 @@ class PinnedPool:
     Closing the pool unlocks its pages but never frees memory that a tensor still uses: views
     handed out before stay valid, as ordinary pageable memory, and each segment is returned to
     the OS when its last tensor dies. A pool that is garbage-collected without being closed
-    unlocks its pages too.
+    unlocks its pages too, except at interpreter exit, where the OS does it.
 
     Not thread-safe.
     """
@@ -89,6 +89,9 @@ class PinnedPool:
         self._closed = False
         # A plain function, not a method: the finalizer must not keep the pool alive.
         self._finalizer = weakref.finalize(self, _release, self._torch, self._segments)
+        # Not at interpreter exit: the CUDA context may already be going away, so waiting for
+        # its streams could fail there, and the OS unlocks and frees the pages anyway.
+        self._finalizer.atexit = False
         remaining = capacity_bytes
         while remaining > 0:
             size = min(segment_bytes, remaining)

@@ -5,6 +5,8 @@
 
 import gc
 import mmap
+import subprocess
+import sys
 
 import pytest
 
@@ -185,3 +187,28 @@ def test_falls_back_to_the_pytorch_pinned_allocator_with_a_warning(monkeypatch, 
         with pytest.warns(UserWarning, match="falling back"):
             pool.alloc(2 * MiB)  # growing takes the same path
     assert int(view.max()) == 5, "views must survive the pool here too"
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("cuda_torn_down", [False, True])
+def test_exiting_without_close_is_silent(cuda_torn_down):
+    code = [
+        "import torch",
+        "from hypertier.stream.pinned import PinnedPool",
+        "pool = PinnedPool(0, segment_bytes=1 << 20)",
+        "view = pool.alloc(1000)",
+        "view.fill_(1)",
+        "assert view.is_pinned()",
+    ]
+    if cuda_torn_down:
+        # What a finalizer running at exit could meet: waiting for the streams fails.
+        code += [
+            "def gone(*args, **kwargs):",
+            "    raise RuntimeError('the CUDA context is gone')",
+            "torch.cuda.synchronize = gone",
+        ]
+    # PyTorch warns on import when NumPy is missing; that is not what this test is about.
+    command = [sys.executable, "-W", "ignore:Failed to initialize NumPy", "-c", "\n".join(code)]
+    done = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False)
+    assert done.returncode == 0, done.stderr
+    assert done.stderr == ""
