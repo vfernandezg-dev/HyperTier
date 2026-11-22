@@ -130,7 +130,11 @@ Create modules only when the current phase needs them.
    subclass, because `generate()` moves its inputs there. With two slots the pieces of
    `lm_head` after the first have no compute to hide behind.
 5. **Weights stream as 4-bit / fp8 / lossless (DFloat11-style)**, never "2.5-bit lossless".
-   Do not compress activations in the compute path; use chunking/tiling (exact) instead.
+   Do not compress activations in the compute path; bound their peak by splitting the work.
+   Splitting is not all exact. Chunking a module over tokens or over the batch computes the
+   same values up to rounding: 1 ulp of bf16 measured, because another shape picks another
+   kernel. Spatial VAE tiling is **approximate**: 40-43 dB of PSNR against the untiled
+   decode, measured on the Wan 2.2 VAE at 480p with 256 px tiles overlapping 32-64 px.
 6. **Triton first, PyTorch fallback.** Kernels must also run under `TRITON_INTERPRET=1` and be
    tested bit-exact (or within tolerance) against a pure-PyTorch reference.
 7. **Native Linux first.** Development and benchmarks run on native Linux only; WSL2 is no longer
@@ -162,6 +166,8 @@ Create modules only when the current phase needs them.
   not `MemAvailable`: freed pages return to it with a lag of hundreds of MiB.
 - A benchmark that compares runs gives each its own process (`bench_llm`): VRAM, page-locked
   RAM and allocator state are not shared, and the parent never opens a CUDA context.
+- Report timings in thermal steady state: warm the GPU up first and record its temperature
+  with the result. On the reference laptop a pass takes about 6 % longer once the GPU is hot.
 - Tests and benchmarks that need real checkpoints read their directory from `HYPERTIER_MODELS`
   (set it in the git-ignored `.env`) and skip without it. Never write that path in the repo.
 
