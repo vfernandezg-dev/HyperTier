@@ -296,8 +296,34 @@ def test_a_newer_permit_for_the_same_slot_cancels_the_older_one():
     assert stale.cancelled and not newer.cancelled
     model.reader.start()
     assert newer.done.wait(5) and stale.done.is_set()
+    model.reader.wait(newer)
+    with pytest.raises(RuntimeError, match=r"block 0 in slot 0 was cancelled"):
+        model.reader.wait(stale)  # not a generation mismatch further on
     model.reader.stop()
     assert model.device.copies == [(3, 0)], "the superseded copy was never made"
+
+
+def test_the_queue_never_holds_two_live_permits_for_one_slot():
+    model = Model(7, 2, 2, [], start=False)  # permits for blocks 0 and 1 are queued
+    rng = random.Random(3)
+    for _ in range(50):  # the model keeps jumping while the reader never runs
+        block = rng.randrange(7)
+        slot, loads = model.table.enter(block)
+        for load in loads:
+            model.issue(load)
+        model.device.free_gen[slot] += 1
+        model.table.exit(block)
+        live = [permit.slot for permit in model.reader._permits if not permit.cancelled]
+        assert sorted(live) == sorted(set(live)) and len(live) <= model.table.num_slots
+    # The reader checks it too: two live permits for slot 0, slipped past issue(), make the
+    # next one fail, whichever slot it is for.
+    for block in (4, 5):
+        rogue = Permit(block, 0, True, 1, 0, time.perf_counter(), done=threading.Event())
+        model.reader._permits.append(rogue)
+    other = Permit(6, 1, True, 1, 0, time.perf_counter(), done=threading.Event())
+    with pytest.raises(AssertionError, match="two live permits for one slot"):
+        model.reader.issue(other)
+    model.reader.stop()
 
 
 def test_a_read_error_reaches_the_main_thread_and_later_permits_fail_fast():
@@ -321,6 +347,8 @@ def test_stop_abandons_a_read_and_releases_whoever_waits():
     model.reader.issue(waiting)
     model.reader.stop()
     assert not model.reader.alive and waiting.done.is_set()
+    with pytest.raises(RuntimeError, match="was cancelled"):
+        model.reader.wait(waiting)
     with pytest.raises(ValueError):
         Reader(model.device, 7, [0], 0)
 

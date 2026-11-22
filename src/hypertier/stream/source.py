@@ -182,16 +182,32 @@ class Reader:
                 if queued.slot == permit.slot:
                     queued.cancelled = True  # its slot goes to the newer block instead
             self._permits.append(permit)
+            # At most one live permit per slot waits in the queue. Two would be two copies
+            # into one slot whose order depends on how the queue is served.
+            live = [queued.slot for queued in self._permits if not queued.cancelled]
+            assert len(live) == len(set(live)), f"two live permits for one slot: {live}"
             self._frontier = permit.block
             self._cv.notify()
 
     def wait(self, permit: Permit) -> None:
-        """Block until the copy for ``permit`` is enqueued; raise what the reader raised."""
+        """Block until the copy for ``permit`` is enqueued.
+
+        Raises what the reader raised, and also when the permit was cancelled: its copy will
+        never be enqueued.
+        """
         self.settle(permit)
         if permit.error is not None:
             raise RuntimeError(
                 f"the weight reader failed while loading block {permit.block}"
             ) from permit.error
+        if permit.cancelled:
+            # Nobody should wait for a permit that lost its slot. Say so here: further on it
+            # would only show up as a slot_ready generation that does not match.
+            raise RuntimeError(
+                f"the permit for block {permit.block} in slot {permit.slot} was cancelled "
+                "before its copy was enqueued: a newer permit took the slot, or the weight "
+                "reader was stopped"
+            )
         if not permit.done.is_set():
             raise RuntimeError("the weight reader thread died")
 
