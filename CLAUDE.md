@@ -20,9 +20,10 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
 ## Status
 
 - Version `0.0.1` (placeholder). Current phase: **F1 — Layer streaming + NVMe tier** (F0 done).
-  Landed: `stream/pingpong.py` (`LayerStreamer` core, LRU `SlotTable`) and `stream/pinned.py`
-  (`PinnedPool`). Pending in F1: NVMe tier and Hugging Face adapter. No stable public API yet —
-  do not invent one beyond the roadmap.
+  Landed: `stream/pingpong.py` (`LayerStreamer` core, LRU `SlotTable`), `stream/pinned.py`
+  (`PinnedPool`), `io/` (safetensors index, `O_DIRECT` reads) and `stream/source.py`
+  (`FileWeights`: RAM tier + NVMe tier behind one reader thread). Pending in F1: Hugging Face
+  adapter and `bench_llm`. No stable public API yet — do not invent one beyond the roadmap.
 - Roadmap: F0 foundations → F1 ping-pong layer streaming + NVMe tier → F2 TurboQuant KV cache +
   Triton kernels → F3 video diffusion (sequential pipeline, chunking, VAE tiling) → F4 MoE expert
   cache + planner → F5 v0.1.0 release.
@@ -40,6 +41,7 @@ pytest -q                       # tests
 TRITON_INTERPRET=1 pytest -q    # run Triton kernels on CPU (no GPU needed)
 python benchmarks/bench_hw.py   # hardware profile -> benchmarks/results/hw_*.json (--quick: smoke)
 python benchmarks/bench_streaming.py  # streaming vs resident model -> results/streaming_*.json
+python benchmarks/bench_streaming.py --checkpoint "$HYPERTIER_MODELS/Qwen3-8B"  # real layers
 ruff check .                    # lint (line length 100, target py310)
 python -m build                 # build sdist + wheel
 ```
@@ -87,7 +89,14 @@ Create modules only when the current phase needs them.
    copy), `slot_free` (copy waits compute). Every parameter is aligned to 256 B in RAM and VRAM.
    Weights wait in a `PinnedPool`: `mmap` memory locked with `cudaHostRegister` at its exact size
    (≈ 1.8 GB/s; 20 GiB verified, `RLIMIT_MEMLOCK` and `/dev/shm` do not limit it). PyTorch's
-   pinned allocator rounds up to a power of two and is only the fallback.
+   pinned allocator rounds up to a power of two, packs small requests 512 B apart (so its
+   memory is not page-aligned) and is only the fallback.
+   Weights read from files (`FileWeights`): blocks that fit the RAM budget stay pinned, the
+   rest are read every pass with `O_DIRECT` in 64 MiB requests (≈ 2.9 GB/s) into staging
+   buffers. One reader thread reads and enqueues every copy; the host order between the two
+   threads is kept by **permits**: only the main thread assigns slots, it issues a permit
+   after `slot_free` is recorded, and it waits for the reader's notice on the host before
+   `wait_event(slot_ready)`. The reader never allocates GPU memory.
    A slot is as large as the biggest block, so oversized blocks waste VRAM in every slot
    (`LayerStreamer` warns above 1.5x the median). Planned for the F1 Hugging Face adapter, not
    implemented yet: keep the token embedding on the CPU and split `lm_head` by vocabulary.
@@ -113,6 +122,8 @@ Create modules only when the current phase needs them.
   results under `benchmarks/results/` (gitignored). Reproducibility matters: results may feed a paper.
 - Measure host RAM as `AnonPages + Shmem` from `read_meminfo()` (pinned memory shows as `Shmem`),
   not `MemAvailable`: freed pages return to it with a lag of hundreds of MiB.
+- Tests and benchmarks that need real checkpoints read their directory from `HYPERTIER_MODELS`
+  (set it in the git-ignored `.env`) and skip without it. Never write that path in the repo.
 
 ## Git and contributions
 
