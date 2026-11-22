@@ -64,6 +64,28 @@ time_per_pass ≥ max(compute, non_resident_active_bytes / link_bandwidth)
 
 Design documents (architecture, bandwidth model and research survey): **coming soon.**
 
+## Results so far
+
+F0 and F1 are done. Qwen3-8B in bf16 (15.3 GiB of weights) on the reference laptop (RTX 3050
+Laptop with 4 GB of VRAM, 32 GB of RAM), measured with `benchmarks/bench_llm.py`: two VRAM
+slots, streamed weights in page-locked RAM, each run in its own process.
+
+| | HyperTier, streamed | `accelerate` offloading | CPU only |
+|---|---|---|---|
+| 32 greedy tokens | identical to the baseline, logits bit for bit | the same tokens | differ from the first one |
+| Peak VRAM while generating | 775 MiB (736 MiB of weights) | 2415 MiB | none |
+| Decoding, seconds per token | 2.28 | 2.88 | 0.45 |
+| Prefill of 512 tokens | 2.3 s | not measured | 81 s |
+| Prefill of 4096 tokens | 4.9 s, 1.7 GiB of VRAM at its peak | not measured | not measured |
+
+The baseline is the stock `transformers` model doing the same operations, with each layer
+copied to the GPU right before it runs.
+
+Decoding a dense model token by token is bound by the link, as the expectations above say:
+every token moves 14.1 GiB over PCIe, while the CPU reads the same weights from RAM several
+times faster. Streaming pays when many tokens share a pass. Choosing where each block is
+computed, per phase, is the planner's job (F4).
+
 ## Installation
 
 ```bash
