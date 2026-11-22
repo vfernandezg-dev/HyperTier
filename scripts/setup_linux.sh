@@ -87,7 +87,8 @@ step "4/6  Creating virtualenv and installing PyTorch + Triton (large download)"
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install torch triton
-python -m pip install -e ".[dev]"
+# "test" adds transformers and accelerate: the model tests and bench_llm are skipped without.
+python -m pip install -e ".[dev,test]"
 
 # ---------------------------------------------------------------------------
 step "5/6  Verifying CUDA, pinned memory and a Triton kernel on the GPU"

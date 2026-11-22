@@ -34,7 +34,13 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
+# Hugging Face adapter (hypertier.adapters). 5.24 is the oldest release it is tested with.
+hf = ["transformers>=5.24"]
 dev = ["pytest>=8", "ruff>=0.6", "build", "twine"]
+# What the model tests and bench_llm need on a machine with a GPU, besides torch. accelerate
+# is only a baseline to compare against: nothing in the package imports it. CI installs
+# "dev" alone and skips these tests.
+test = ["transformers>=5.24", "accelerate>=1.16"]
 
 [project.urls]
 Homepage = "https://github.com/vfernandezg-dev/HyperTier"

@@ -21,6 +21,11 @@ ruff check .
 
 Triton kernels can be tested without a GPU by setting `TRITON_INTERPRET=1`.
 
+Without the script, `pip install -e ".[dev]"` is enough for what CI runs. The tests that load
+Hugging Face models and `benchmarks/bench_llm.py` also need a GPU, PyTorch and
+`pip install -e ".[test]"`; they are skipped otherwise. Tests on real checkpoints read their
+directory from the `HYPERTIER_MODELS` environment variable and are skipped without it.
+
 ## Pull requests
 
 1. Open an issue first for anything larger than a small fix.
