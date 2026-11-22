@@ -19,8 +19,10 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
 
 ## Status
 
-- Version `0.0.1` (placeholder). Current phase: **F0 — Foundations** (environment, hardware bandwidth
-  probe, VRAM tracker, CI). No public API yet — do not invent one beyond the roadmap.
+- Version `0.0.1` (placeholder). Current phase: **F1 — Layer streaming + NVMe tier** (F0 done).
+  Landed: `stream/pingpong.py` (`LayerStreamer` core, LRU `SlotTable`) and `stream/pinned.py`
+  (`PinnedPool`). Pending in F1: NVMe tier and Hugging Face adapter. No stable public API yet —
+  do not invent one beyond the roadmap.
 - Roadmap: F0 foundations → F1 ping-pong layer streaming + NVMe tier → F2 TurboQuant KV cache +
   Triton kernels → F3 video diffusion (sequential pipeline, chunking, VAE tiling) → F4 MoE expert
   cache + planner → F5 v0.1.0 release.
@@ -37,6 +39,7 @@ source .venv/bin/activate
 pytest -q                       # tests
 TRITON_INTERPRET=1 pytest -q    # run Triton kernels on CPU (no GPU needed)
 python benchmarks/bench_hw.py   # hardware profile -> benchmarks/results/hw_*.json (--quick: smoke)
+python benchmarks/bench_streaming.py  # streaming vs resident model -> results/streaming_*.json
 ruff check .                    # lint (line length 100, target py310)
 python -m build                 # build sdist + wheel
 ```
@@ -77,8 +80,12 @@ Create modules only when the current phase needs them.
    de-rotating (`<q,k> = ‖k‖·<Rq, c[idx]>`); values accumulated in rotated basis, de-rotated once.
 4. **Model-agnostic streaming via forward hooks** that repoint `param.data` to VRAM slot views.
    Do not rewrite model classes. Slots are assigned **LRU, never `i % num_slots`** (breaks with odd
-   block counts + cyclic prefetch). CUDA events: `slot_ready` (compute waits copy),
-   `slot_free` (copy waits compute).
+   block counts + cyclic prefetch), and LRU never evicts a block of the current prefetch window
+   (plain LRU drops pending prefetches from 4 slots up). CUDA events: `slot_ready` (compute waits
+   copy), `slot_free` (copy waits compute). Every parameter is aligned to 256 B in RAM and VRAM.
+   A slot is as large as the biggest block, so oversized blocks waste VRAM in every slot
+   (`LayerStreamer` warns above 1.5x the median). Planned for the F1 Hugging Face adapter, not
+   implemented yet: keep the token embedding on the CPU and split `lm_head` by vocabulary.
 5. **Weights stream as 4-bit / fp8 / lossless (DFloat11-style)**, never "2.5-bit lossless".
    Do not compress activations in the compute path; use chunking/tiling (exact) instead.
 6. **Triton first, PyTorch fallback.** Kernels must also run under `TRITON_INTERPRET=1` and be
@@ -99,6 +106,8 @@ Create modules only when the current phase needs them.
 - Each kernel or algorithm ships with: reference implementation, test against it, and a benchmark.
 - Benchmarks must record hardware, driver, CUDA/torch/triton versions and config, and write
   results under `benchmarks/results/` (gitignored). Reproducibility matters: results may feed a paper.
+- Measure host RAM as `AnonPages + Shmem` from `read_meminfo()` (pinned memory shows as `Shmem`),
+  not `MemAvailable`: freed pages return to it with a lag of hundreds of MiB.
 
 ## Git and contributions
 
