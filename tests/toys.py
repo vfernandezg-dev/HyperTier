@@ -179,3 +179,25 @@ def tiny_causal_lm(directory, family="qwen3", *, tied=False, dtype="bfloat16", s
             param.mul_(4.0)
     model.to(getattr(torch, dtype)).save_pretrained(directory)
     return directory
+
+
+def tiny_text_encoder(directory, family="umt5", *, dtype="bfloat16", seed=0):
+    """Write a random tiny encoder-only text model as a normal ``transformers`` checkpoint.
+
+    Five blocks of width 64 and a vocabulary of 1500. Returns ``directory``.
+    """
+    import torch
+    import transformers
+
+    config_cls, model_cls = {
+        "umt5": (transformers.UMT5Config, transformers.UMT5EncoderModel),
+        "t5": (transformers.T5Config, transformers.T5EncoderModel),
+    }[family]
+    config = config_cls(
+        vocab_size=1500, d_model=64, d_kv=16, d_ff=128, num_layers=5, num_heads=4,
+        relative_attention_num_buckets=8, relative_attention_max_distance=16,
+        dropout_rate=0.0, feed_forward_proj="gated-gelu", pad_token_id=0, eos_token_id=1,
+    )  # fmt: skip
+    torch.manual_seed(seed)
+    model_cls(config).to(getattr(torch, dtype)).save_pretrained(directory)
+    return directory

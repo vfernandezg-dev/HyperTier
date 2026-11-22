@@ -12,11 +12,11 @@ import sys
 from itertools import pairwise
 
 import pytest
-from toys import tiny_causal_lm
+from toys import tiny_causal_lm, tiny_text_encoder
 
 from hypertier.adapters import _skeleton as skeleton
 from hypertier.adapters import hf_transformers as hf
-from hypertier.adapters import load_causal_lm
+from hypertier.adapters import load_causal_lm, load_text_encoder
 
 MiB = 1 << 20
 
@@ -275,3 +275,159 @@ def test_real_checkpoint_generates_the_tokens_of_the_resident_model(transformers
     assert torch.equal(tokens, want_tokens)
     # One position per step: on the reference GPU even the stock head gives the same bits.
     assert (logits.float() - want_logits.float()).abs().max() <= 0.25
+
+
+# ---------------------------------------------------------------------------------------------
+# Text encoders
+
+
+def load_resident_encoder(directory):
+    import transformers
+
+    model = transformers.AutoModelForTextEncoding.from_pretrained(directory, dtype="auto")
+    return model.cuda().eval()
+
+
+def padded_prompts(length=17, seed=1):
+    """Two rows of token ids, the second one padded, and their attention mask."""
+    import torch
+
+    ids = torch.randint(3, 1500, (2, length), generator=torch.Generator().manual_seed(seed))
+    mask = torch.ones_like(ids)
+    ids[1, 11:], mask[1, 11:] = 0, 0
+    return ids, mask
+
+
+def reader_threads():
+    import threading
+
+    return [thread for thread in threading.enumerate() if thread.name == "hypertier-reader"]
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("family", "dtype", "slots", "keep_in_ram"),
+    [
+        ("umt5", "bfloat16", 2, False), ("umt5", "bfloat16", 2, True),
+        ("umt5", "float32", 1, False), ("t5", "bfloat16", 3, False), ("t5", "float32", 2, True),
+    ],
+)  # fmt: skip
+def test_a_text_encoder_gives_the_hidden_states_of_the_resident_model(
+    transformers, disk_tmp, family, dtype, slots, keep_in_ram
+):
+    import torch
+
+    tiny_text_encoder(disk_tmp, family, dtype=dtype)
+    ids, mask = padded_prompts()
+    with torch.inference_mode():
+        want = load_resident_encoder(disk_tmp)(ids.cuda(), mask.cuda()).last_hidden_state
+    assert bool(torch.isfinite(want).all()) and float(want.float().std()) > 0.01
+    with load_text_encoder(disk_tmp, slots=slots, keep_in_ram=keep_in_ram) as streamed:
+        assert set(streamed.streamer.tiers) == {"ram" if keep_in_ram else "nvme"}
+        with torch.inference_mode():
+            for _ in range(2):  # the second call streams every block again
+                got = streamed.model(ids.cuda(), mask.cuda()).last_hidden_state
+                assert got.device.type == "cuda" and torch.equal(got, want)
+
+
+@pytest.mark.cuda
+def test_the_weights_of_a_text_encoder_are_placed_by_how_they_are_used(transformers, disk_tmp):
+    import torch
+
+    tiny_text_encoder(disk_tmp)
+    before = torch.cuda.memory_allocated()
+    with load_text_encoder(disk_tmp) as streamed:
+        model, streamer = streamed.model, streamed.streamer
+        assert isinstance(model, transformers.UMT5EncoderModel)
+        assert type(model).__name__ == "UMT5EncoderModel"
+        assert model.device == streamed.device == torch.device("cuda", 0)
+        # One table, on the CPU, for the two modules that look tokens up.
+        assert model.shared.weight is model.encoder.embed_tokens.weight
+        assert model.shared.weight.device.type == "cpu"
+        assert all(p.device.type == "meta" for p in model.encoder.block.parameters())
+        assert model.encoder.final_layer_norm.weight.device.type == "cuda"
+        assert not any(p.requires_grad for p in model.parameters())
+        assert streamed.head_rows == () and streamer.num_blocks == 5
+        assert streamed.resident_bytes == 64 * 2
+        assert streamed.embedding_bytes == 1500 * 64 * 2
+        assert streamed.vram_bytes == 2 * streamer.slot_bytes + streamed.resident_bytes
+        assert torch.cuda.memory_allocated() - before <= streamed.vram_bytes + 4096
+        # Nothing waits in RAM but two staging buffers: every block comes from disk.
+        assert set(streamer.tiers) == {"nvme"} and len(reader_threads()) == 1
+        staging = streamed.ram_bytes // 2
+        assert streamer.slot_bytes <= staging <= streamer.slot_bytes + 2 * 4096
+    with load_text_encoder(disk_tmp, keep_in_ram=True) as streamed:
+        assert set(streamed.streamer.tiers) == {"ram"} and not reader_threads()
+        assert streamed.ram_bytes >= streamed.streamer.streamed_bytes
+
+
+@pytest.mark.cuda
+def test_closing_a_text_encoder_undoes_everything(transformers, disk_tmp):
+    import torch
+
+    tiny_text_encoder(disk_tmp)
+    before = torch.cuda.memory_allocated()
+    streamed = load_text_encoder(disk_tmp)
+    model = streamed.model
+    ids, mask = padded_prompts()
+    with torch.inference_mode():
+        hidden = model(ids.cuda(), mask.cuda()).last_hidden_state.cpu()
+    assert hidden.shape == (2, 17, 64)
+    streamed.close()
+    streamed.close()  # idempotent
+    assert type(model) is transformers.UMT5EncoderModel
+    assert model.shared.weight is model.encoder.embed_tokens.weight
+    assert all(p.device.type == "meta" for p in model.parameters())
+    for module in (model.shared, model.encoder.embed_tokens):
+        assert not module._forward_hooks and not module._forward_pre_hooks
+    assert torch.cuda.memory_allocated() == before
+    assert not reader_threads()
+
+
+@pytest.mark.cuda
+def test_a_text_encoder_that_does_not_match_its_checkpoint_is_refused(transformers, disk_tmp):
+    import json
+
+    import torch
+
+    tiny_text_encoder(disk_tmp)
+    before = torch.cuda.memory_allocated()
+    config = json.loads((disk_tmp / "config.json").read_text())
+    (disk_tmp / "config.json").write_text(json.dumps({**config, "num_layers": 6}))
+    with pytest.raises(ValueError, match=r"'encoder\.block\.5\..*' is not in the checkpoint"):
+        load_text_encoder(disk_tmp)
+    (disk_tmp / "config.json").write_text(json.dumps({**config, "vocab_size": 1400}))
+    with pytest.raises(ValueError, match=r"the model expects torch.bfloat16 \[1400, 64\]"):
+        load_text_encoder(disk_tmp)
+    assert torch.cuda.memory_allocated() == before, "a failed load leaves nothing on the GPU"
+    assert not reader_threads()
+
+
+@pytest.mark.cuda
+def test_the_real_umt5_gives_the_same_embeddings_from_disk_and_from_ram(
+    transformers, models_dir
+):
+    import torch
+
+    root = models_dir / "Wan2.2-TI2V-5B-Diffusers"
+    if not (root / "text_encoder").is_dir():
+        pytest.skip("Wan2.2-TI2V-5B-Diffusers is not downloaded")
+    tokenizer = transformers.AutoTokenizer.from_pretrained(root / "tokenizer")
+    batch = tokenizer(
+        ["Two cats boxing on a spotlighted stage", ""], padding="max_length", max_length=512,
+        truncation=True, return_attention_mask=True, return_tensors="pt",
+    )  # fmt: skip
+    outputs = []
+    for keep_in_ram in (False, True):
+        before = torch.cuda.memory_allocated()
+        with load_text_encoder(root / "text_encoder", keep_in_ram=keep_in_ram) as streamed:
+            assert streamed.streamer.num_blocks == 24
+            assert streamed.vram_bytes <= 737 * MiB  # two slots of 368 MiB against 8.6 GiB
+            assert (streamed.ram_bytes > 8 * 1024 * MiB) == keep_in_ram
+            with torch.inference_mode():
+                hidden = streamed.model(batch.input_ids.cuda(), batch.attention_mask.cuda())
+            outputs.append(hidden.last_hidden_state.cpu())
+            del hidden  # the output is the last thing of the model on the GPU
+        assert torch.cuda.memory_allocated() == before
+    assert outputs[0].shape == (2, 512, 4096) and bool(torch.isfinite(outputs[0]).all())
+    assert torch.equal(outputs[0], outputs[1])
