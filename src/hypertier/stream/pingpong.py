@@ -226,7 +226,8 @@ class PassStats:
     bytes_read: int = 0
     read_stall_ms: float = 0.0  # host time the model waited for the reader thread
     # From asking for a copy to having it enqueued, per block. With a reader thread this
-    # includes waiting for a disk read that is not finished, which nothing can shorten.
+    # includes waiting for a disk read that is not finished, which nothing can shorten, and
+    # the rare wait of a timing event behind a blocking read (see ``_TimingEvents``).
     enqueue_ms: float = 0.0  # median
     enqueue_p99_ms: float = 0.0
     # The part of it spent with the bytes already in RAM: the reader was busy with something
@@ -247,7 +248,14 @@ class _PassRecord:
 class _TimingEvents:
     """Recycles timing events: a pass needs five per block, every pass.
 
-    Shared with the reader thread, which times the copies it enqueues.
+    Shared with the reader thread, which times the copies it enqueues. Recording a timing
+    event can wait for as long as another thread stays in a blocking read of a GPU tensor
+    (``.item()``, ``.to("cpu")``); events without timing and the copies themselves do not.
+    So with telemetry on, a copy asked for while the model's caller waits for a result (the
+    next token, in ``generate()``) may be enqueued only when that result arrives. Measured on
+    Qwen3-8B: it happened in 2 of 31 generated tokens (hand-off p99 of those passes 681 ms)
+    and neither took longer for it, since with two slots that copy could not have started
+    before the pass ended anyway.
     """
 
     def __init__(self, torch: Any) -> None:

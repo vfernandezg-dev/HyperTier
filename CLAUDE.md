@@ -22,8 +22,11 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
 - Version `0.0.1` (placeholder). Current phase: **F1 — Layer streaming + NVMe tier** (F0 done).
   Landed: `stream/pingpong.py` (`LayerStreamer` core, LRU `SlotTable`), `stream/pinned.py`
   (`PinnedPool`), `io/` (safetensors index, `O_DIRECT` reads) and `stream/source.py`
-  (`FileWeights`: RAM tier + NVMe tier behind one reader thread). Pending in F1: Hugging Face
-  adapter and `bench_llm`. No stable public API yet — do not invent one beyond the roadmap.
+  (`FileWeights`: RAM tier + NVMe tier behind one reader thread), `adapters/hf_transformers.py`
+  (`load_causal_lm`) and `bench_llm`. F1 exit criterion measured with `bench_llm` on Qwen3-8B
+  (2 slots, all blocks in RAM): same tokens as the strict baseline, 0.77 GB of weights in VRAM,
+  prefill overlap efficiency 0.90-1.00. Pending in F1: reader hand-off (issue #4).
+  No stable public API yet — do not invent one beyond the roadmap.
 - Roadmap: F0 foundations → F1 ping-pong layer streaming + NVMe tier → F2 TurboQuant KV cache +
   Triton kernels → F3 video diffusion (sequential pipeline, chunking, VAE tiling) → F4 MoE expert
   cache + planner → F5 v0.1.0 release.
@@ -33,7 +36,8 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
 ## Commands
 
 ```bash
-# one-time setup on Linux (apt deps, .venv, torch+triton, verifies GPU, runs tests; detects WSL2)
+# one-time setup on Linux (apt deps, .venv, torch+triton, ".[dev,test]", verifies GPU, runs tests;
+# detects WSL2). The "test" extra is transformers + accelerate: model tests and bench_llm need it.
 bash scripts/setup_linux.sh
 source .venv/bin/activate
 
@@ -42,6 +46,7 @@ TRITON_INTERPRET=1 pytest -q    # run Triton kernels on CPU (no GPU needed)
 python benchmarks/bench_hw.py   # hardware profile -> benchmarks/results/hw_*.json (--quick: smoke)
 python benchmarks/bench_streaming.py  # streaming vs resident model -> results/streaming_*.json
 python benchmarks/bench_streaming.py --checkpoint "$HYPERTIER_MODELS/Qwen3-8B"  # real layers
+python benchmarks/bench_llm.py --model "$HYPERTIER_MODELS/Qwen3-8B"  # tokens, VRAM, prefill overlap
 ruff check .                    # lint (line length 100, target py310)
 python -m build                 # build sdist + wheel
 ```
@@ -75,6 +80,10 @@ Create modules only when the current phase needs them.
    `t ≈ max(c, x) + (1 − e)·min(c, x)` (`c` compute, `x` transfer, `e` copy/compute overlap
    efficiency). Take `e` from `bench_hw` on the target machine, never hard-code it:
    ≈ 0.95 on native Linux, ≈ 0.7 on WSL2 for copies ≥ 64 MiB (issue #1).
+   The CPU is a link too, and a faster one: it reads weights from RAM at ≈ 36 GB/s on the
+   reference laptop, against 6.7 GB/s over PCIe. Qwen3-8B decodes at 0.45 s/token on the CPU
+   and 2.33 s/token streamed (one token per pass: nothing hides the copies), while a prefill of
+   512 tokens takes 81 s on the CPU and 2.3 s streamed.
 2. **KV cache = TurboQuant-MSE** (random rotation + Lloyd-Max codebook per coordinate, calibration-free).
    **QJL residual is OFF by default** (hurts softmax attention at equal bit budget; arXiv:2605.08114).
    Give keys more bits than values. Keep boundary layers and a recent-token window in fp16.
@@ -96,10 +105,19 @@ Create modules only when the current phase needs them.
    buffers. One reader thread reads and enqueues every copy; the host order between the two
    threads is kept by **permits**: only the main thread assigns slots, it issues a permit
    after `slot_free` is recorded, and it waits for the reader's notice on the host before
-   `wait_event(slot_ready)`. The reader never allocates GPU memory.
+   `wait_event(slot_ready)`. The reader never allocates GPU memory. Recording a *timing*
+   CUDA event can block while another thread is in a blocking read (`.item()`, `.to("cpu")`);
+   plain events and copies do not, so only telemetry is exposed to it.
    A slot is as large as the biggest block, so oversized blocks waste VRAM in every slot
-   (`LayerStreamer` warns above 1.5x the median). Planned for the F1 Hugging Face adapter, not
-   implemented yet: keep the token embedding on the CPU and split `lm_head` by vocabulary.
+   (`LayerStreamer` warns above 1.5x the median).
+   The Hugging Face adapter (`adapters/hf_transformers.py`, `load_causal_lm`) builds the model
+   with its own `__init__` while a registration hook sends every `Parameter` to `meta`:
+   buffers are then computed on the CPU as in a normal load (`inv_freq` computed on the GPU
+   differs in the last bits). The token embedding stays on the CPU as a private `mmap` of the
+   checkpoint, `lm_head` is streamed as ranges of vocabulary rows no larger than a layer
+   (`TensorEntry.rows`), and `model.device` answers with the GPU through a per-instance
+   subclass, because `generate()` moves its inputs there. With two slots the pieces of
+   `lm_head` after the first have no compute to hide behind.
 5. **Weights stream as 4-bit / fp8 / lossless (DFloat11-style)**, never "2.5-bit lossless".
    Do not compress activations in the compute path; use chunking/tiling (exact) instead.
 6. **Triton first, PyTorch fallback.** Kernels must also run under `TRITON_INTERPRET=1` and be
@@ -122,6 +140,8 @@ Create modules only when the current phase needs them.
   results under `benchmarks/results/` (gitignored). Reproducibility matters: results may feed a paper.
 - Measure host RAM as `AnonPages + Shmem` from `read_meminfo()` (pinned memory shows as `Shmem`),
   not `MemAvailable`: freed pages return to it with a lag of hundreds of MiB.
+- A benchmark that compares runs gives each its own process (`bench_llm`): VRAM, page-locked
+  RAM and allocator state are not shared, and the parent never opens a CUDA context.
 - Tests and benchmarks that need real checkpoints read their directory from `HYPERTIER_MODELS`
   (set it in the git-ignored `.env`) and skip without it. Never write that path in the repo.
 
