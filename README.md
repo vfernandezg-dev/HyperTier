@@ -53,14 +53,24 @@ time_per_pass ≥ max(compute, non_resident_active_bytes / link_bandwidth)
 
 ## Roadmap (v0.1.0 MVP)
 
-| Phase | Deliverable |
-|---|---|
-| F0 | Foundations: CI (CPU + Triton interpreter), hardware bandwidth probe, VRAM tracker |
-| F1 | Ping-pong layer streaming + NVMe tier + Hugging Face adapter |
-| F2 | TurboQuant KV cache + Triton kernels |
-| F3 | Video diffusion: sequential pipeline, chunking, VAE tiling (Wan 2.2 TI2V-5B) |
-| F4 | MoE expert cache + planner v0 |
-| F5 | `pip install hypertier` v0.1.0 with reproducible examples on a 4 GB GPU |
+| Phase | Deliverable | Status |
+|---|---|---|
+| F0 | Foundations: CI (CPU + Triton interpreter), hardware bandwidth probe, VRAM tracker | done |
+| F1 | Ping-pong layer streaming + NVMe tier + Hugging Face adapter | done |
+| F2 | TurboQuant KV cache + Triton kernels | third: after F4 |
+| F3 | Video diffusion: sequential pipeline, chunking, VAE tiling (Wan 2.2 TI2V-5B) | first: in progress |
+| F4 | MoE expert cache + planner v0 | second: after F3 |
+| F5 | `pip install hypertier` v0.1.0 with reproducible examples on a 4 GB GPU | last |
+
+The phase numbers are names, not the order. After F1 the order is **F3 → F4 → F2**, then F5:
+
+- **F3 first.** Video diffusion uses no KV cache, and it is where streaming pays most: a
+  denoising step runs thousands of tokens through every block, so the copies hide behind
+  compute.
+- **F4 next.** The planner decides on which device each block is computed in each phase:
+  resident on the GPU, on the CPU, or streamed.
+- **F2 last.** Where the KV cache lives depends on where attention is computed, and that is
+  what F4 decides.
 
 Design documents (architecture, bandwidth model and research survey): **coming soon.**
 
