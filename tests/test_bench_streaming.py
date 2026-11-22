@@ -37,7 +37,7 @@ def test_summary_lists_every_case(bench):
     case = {
         "rows": 8192, "slots": 2, "resident_ms": 275.5, "streamed_ms": 279.1, "copy_ms": 70.7,
         "stall_ms": 0.02, "efficiency": 0.949, "bound_fraction": 0.987, "copy_gbps": 6.65,
-        "misses": 0, "bit_exact": True,
+        "misses_per_pass": 0, "bit_exact": True,
     }
     payload = {
         "metadata": {"timestamp_utc": "2026-11-22T00:00:00+00:00"},
@@ -46,7 +46,7 @@ def test_summary_lists_every_case(bench):
                       "dtype": "float16"},
             "builds": [{"slots": 2, "weights_vram_bytes": 128 << 20, "pinned_bytes": 896 << 20,
                         "pin_seconds": 0.5, "build_seconds": 0.8}],
-            "cases": [case, {**case, "slots": 1, "bit_exact": False}],
+            "cases": [case, {**case, "slots": 1, "misses_per_pass": 7.0, "bit_exact": False}],
         },
     }
     lines = bench.format_summary(payload).splitlines()
@@ -55,7 +55,7 @@ def test_summary_lists_every_case(bench):
     rows = [line.split() for line in lines if line.strip().startswith("8192")]
     assert [row[1] for row in rows] == ["2", "1"]
     assert rows[0][2:7] == ["275.5", "70.7", "279.1", "0.0", "0.95"]
-    assert rows[0][-1] == "yes" and rows[1][-1] == "NO"
+    assert rows[0][-2:] == ["0", "yes"] and rows[1][-2:] == ["7", "NO"]
     assert bench.format_summary({}).strip().startswith("HyperTier layer streaming")
 
 
@@ -70,5 +70,8 @@ def test_quick_run_writes_json(bench, tmp_path):
     assert code == 0, [c for c in cases if not c["bit_exact"]]
     assert data["schema"] == bench.SCHEMA and data["metadata"]["gpu"]["name"]
     assert len(cases) == len(bench.QUICK.rows) * len(bench.QUICK.slots)
-    assert all(c["bit_exact"] and c["misses"] == 0 or c["slots"] == 1 for c in cases)
+    assert all(c["bit_exact"] for c in cases)
+    # One slot cannot prefetch: every block but the one already loaded is a demand load.
+    demand_loads = {1: bench.QUICK.blocks}
+    assert all(c["misses_per_pass"] == demand_loads.get(c["slots"], 0) for c in cases)
     assert all(c["copies_per_pass"] == bench.QUICK.blocks for c in cases)
