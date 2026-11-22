@@ -230,8 +230,9 @@ class PassStats:
     # the rare wait of a timing event behind a blocking read (see ``_TimingEvents``).
     enqueue_ms: float = 0.0  # median
     enqueue_p99_ms: float = 0.0
-    # The part of it spent with the bytes already in RAM: the reader was busy with something
-    # else (a read request for another block). A second thread could remove only this.
+    # The part of it spent with the bytes already in RAM. With a reader thread, it was busy
+    # with something else (a read request for another block); without one, this is just the
+    # time the main thread takes to enqueue a copy.
     handoff_ms: float = 0.0  # median
     handoff_p99_ms: float = 0.0
 
@@ -337,8 +338,8 @@ class LayerStreamer:
         telemetry: time every pass with CUDA events (see :meth:`pass_stats`).
         weights: read the weights from safetensors files instead of taking them from the
             modules (:class:`~hypertier.stream.source.FileWeights`). Blocks that do not fit in
-            its RAM budget are read from disk on every pass by a reader thread, and a block's
-            parameters are ``meta`` placeholders outside its forward.
+            its RAM budget are read from disk on every pass by a reader thread, which exists
+            only then, and a block's parameters are ``meta`` placeholders outside its forward.
 
     While attached, streamed parameters have ``requires_grad=False`` (a slot is overwritten
     right after its block ran, so gradients could not be computed), and the blocks' buffers
@@ -416,7 +417,7 @@ class LayerStreamer:
         self._src: list[list[Any]] = []  # per block, what the main thread copies from
         self._weights = weights
         self._backend: FileBackend | None = None
-        self._reader: Any = None  # the thread that enqueues copies, with weights from files
+        self._reader: Any = None  # the thread that enqueues copies, when blocks come from disk
         self._free_gen: list[int] = []  # how many times slot_free / slot_ready were recorded
         self._ready_gen: list[int] = []
         self._slot_permit: list[Permit | None] = []  # the copy last asked for, per slot
@@ -532,6 +533,10 @@ class LayerStreamer:
             # Reads the RAM tier into the pool and reserves the staging buffers.
             self._backend = FileBackend(self, weights, plans, pool)
             self.tiers, self.ram_bytes = self._backend.tiers, self._backend.ram_bytes
+            if self._backend.reader is None:
+                # Nothing comes from disk: this thread enqueues every copy, as it does with
+                # weights in memory, and no copy waits to be handed to another thread.
+                self._src = [self._backend.ram_sources(i) for i in range(len(sizes))]
             # At rest a block has no memory at all: meta tensors of the real shape and dtype.
             at_rest = [[_placeholder(torch, p) for p, _, _ in entries] for entries in layouts]
             self._load_buffers(weights.prefixes)
@@ -589,7 +594,7 @@ class LayerStreamer:
             self._hooks.append(
                 block.register_forward_hook(partial(self._exit, index), always_call=True)
             )
-        if self._backend is not None:
+        if self._backend is not None and self._backend.reader is not None:
             self._reader = self._backend.reader
             self._reader.start()
         for load in table.prime():
@@ -663,7 +668,7 @@ class LayerStreamer:
             hook.remove()
         self._hooks.clear()
         if self._backend is not None:
-            self._backend.reader.stop()  # no copy is enqueued after this
+            self._backend.stop()  # no copy is enqueued after this
         if self._copy_stream is not None:
             # A queued copy still reads the pool and writes a slot, and queued kernels still
             # read the slots: nothing below may be released before both streams are idle.
@@ -768,8 +773,9 @@ class LayerStreamer:
     def _issue(self, load: Load, record: _PassRecord | None) -> None:
         """Ask for the copy of a block into its slot, whose last user has recorded slot_free.
 
-        With weights in memory the main thread enqueues it here. With weights from files it
-        becomes a permit for the reader thread, which enqueues it once the bytes are in RAM.
+        With every block in RAM (weights in memory, or read from files into the RAM tier) the
+        main thread enqueues it here. When some block is read from disk it becomes a permit
+        for the reader thread, which enqueues it once the bytes are in RAM.
         """
         slot, nbytes = load.slot, self._sizes[load.block]
         permit = Permit(
@@ -796,7 +802,8 @@ class LayerStreamer:
         permit.ready_gen = self._ready_gen[slot]
         if permit.timed:
             permit.finished = self._events.record(stream)
-        permit.enqueued = permit.available = time.perf_counter()
+        permit.available = permit.issued  # the bytes were in RAM all along
+        permit.enqueued = time.perf_counter()
 
     # -----------------------------------------------------------------------------------------
     # Telemetry

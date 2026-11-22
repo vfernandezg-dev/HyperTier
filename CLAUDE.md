@@ -102,7 +102,9 @@ Create modules only when the current phase needs them.
    memory is not page-aligned) and is only the fallback.
    Weights read from files (`FileWeights`): blocks that fit the RAM budget stay pinned, the
    rest are read every pass with `O_DIRECT` in 64 MiB requests (≈ 2.9 GB/s) into staging
-   buffers. One reader thread reads and enqueues every copy; the host order between the two
+   buffers. When a block comes from disk, one reader thread reads and enqueues every copy;
+   with every block in RAM there is no thread and the main thread enqueues them, as with
+   weights in memory (issue #4). The host order between the two
    threads is kept by **permits**: only the main thread assigns slots, it issues a permit
    after `slot_free` is recorded, and it waits for the reader's notice on the host before
    `wait_event(slot_ready)`. The reader never allocates GPU memory. Recording a *timing*

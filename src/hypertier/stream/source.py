@@ -10,10 +10,12 @@ a few page-locked *staging* buffers, ahead of their use, and copied to VRAM from
     NVMe --pread, O_DIRECT, 64 MiB requests--> staging --H2D--> VRAM slot --> block
                            RAM tier: pinned for good ----H2D-->
 
-One thread, the reader, does the disk reads and enqueues every host-to-device copy, so a copy
-can start the moment its bytes are in RAM, while the main thread is busy running the model.
-Two threads on the same CUDA events need an order that holds on the host, not only on the
-device, and that order is the *permit*:
+When at least one block is read from disk, one thread, the reader, does the disk reads and
+enqueues every host-to-device copy, so a copy can start the moment its bytes are in RAM,
+while the main thread is busy running the model. (With every block in the RAM tier there is
+nothing to read and no thread: the main thread enqueues the copies itself, as it does with
+weights in memory.) Two threads on the same CUDA events need an order that holds on the host,
+not only on the device, and that order is the *permit*:
 
 * The main thread alone assigns VRAM slots. It issues a permit for (block, slot) only after
   ``slot_free`` of the slot's previous user was recorded.
@@ -587,6 +589,8 @@ class FileBackend:
 
     Built by ``LayerStreamer`` on the main thread, which also owns the slots, the events and
     their generation counters (``owner``); this object is the reader's :class:`Driver`.
+    ``reader`` is None when every block is in the RAM tier: a thread would only add a
+    hand-off between asking for a copy and enqueueing it.
     """
 
     def __init__(
@@ -624,7 +628,7 @@ class FileBackend:
             self._stage_src.append(
                 {i: [buffer[src : src + n] for src, _, n in plans[i].spans] for i in nvme}
             )
-        self.reader = Reader(self, len(plans), nvme, weights.num_stage)
+        self.reader = Reader(self, len(plans), nvme, weights.num_stage) if nvme else None
 
     # ---- Driver: these run on the reader thread
 
@@ -673,8 +677,17 @@ class FileBackend:
 
     # ---- main thread
 
+    def ram_sources(self, block: int) -> list[Any]:
+        """What to copy a RAM-tier block from, piece by piece as its slot expects them."""
+        return self._ram_src[block]
+
+    def stop(self) -> None:
+        """Stop the reader, if there is one: no copy is enqueued by it after this."""
+        if self.reader is not None:
+            self.reader.stop()
+
     def close(self) -> None:
-        self.reader.stop()
+        self.stop()
         self._io.close()
         for view in self._stage_bytes:
             view.release()
