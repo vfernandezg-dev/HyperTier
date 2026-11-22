@@ -431,6 +431,13 @@ def test_build_keeps_ram_at_the_model_plus_one_block():
         pass
     # Realistic blocks: biases and a width that is no power of two (61.05 MiB each).
     model = toy_mlp(7, 4000, dtype="float16")
+    # Each weight in a mapping of its own, which goes back to the system when the tensor is
+    # freed. malloc may serve a tensor from memory that an earlier test left free in the
+    # heap, and that memory stays in use afterwards: the build would be charged with it.
+    for param in model.parameters():
+        own = mmap.mmap(-1, param.numel() * param.element_size())
+        param.data = torch.frombuffer(own, dtype=param.dtype).view(param.shape).copy_(param.data)
+    del param, own
     weights = sum(p.numel() * p.element_size() for p in model.parameters())
     corner = model.blocks[6].fc2.weight[:8, :8].clone()
     gc.collect()
