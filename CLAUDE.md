@@ -19,17 +19,29 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
 
 ## Status
 
-- Version `0.0.1` (placeholder). Current phase: **F1 — Layer streaming + NVMe tier** (F0 done).
-  Landed: `stream/pingpong.py` (`LayerStreamer` core, LRU `SlotTable`), `stream/pinned.py`
-  (`PinnedPool`), `io/` (safetensors index, `O_DIRECT` reads) and `stream/source.py`
-  (`FileWeights`: RAM tier + NVMe tier behind one reader thread), `adapters/hf_transformers.py`
-  (`load_causal_lm`) and `bench_llm`. F1 exit criterion measured with `bench_llm` on Qwen3-8B
-  (2 slots, all blocks in RAM): same tokens as the strict baseline, 0.77 GB of weights in VRAM,
-  prefill overlap efficiency 0.90-1.00. Pending in F1: reader hand-off (issue #4).
-  No stable public API yet — do not invent one beyond the roadmap.
-- Roadmap: F0 foundations → F1 ping-pong layer streaming + NVMe tier → F2 TurboQuant KV cache +
-  Triton kernels → F3 video diffusion (sequential pipeline, chunking, VAE tiling) → F4 MoE expert
-  cache + planner → F5 v0.1.0 release.
+- Version `0.0.1` (placeholder). **F0 and F1 are done.** F1 landed `stream/pingpong.py`
+  (`LayerStreamer` core, LRU `SlotTable`), `stream/pinned.py` (`PinnedPool`), `io/` (safetensors
+  index, `O_DIRECT` reads), `stream/source.py` (`FileWeights`: RAM tier + NVMe tier),
+  `adapters/hf_transformers.py` (`load_causal_lm`) and `bench_llm`.
+- **Order from here: F3 → F4 → F2**, then F5. Not the numeric order, for these reasons:
+  - F3 (video diffusion) first: it uses no KV cache, and it is where streaming wins most
+    clearly: thousands of tokens per step, far above the crossover of ≈ 13 tokens per pass
+    (decision 8).
+  - F4 (MoE + planner) next: it decides on which device each block is computed in each phase
+    (resident on the GPU, on the CPU, or streamed).
+  - F2 (KV-cache compression) last: where the KV cache lives depends on where attention is
+    computed, and that is what F4 decides.
+- F1 exit criterion, measured with `bench_llm` on Qwen3-8B (2 slots, all blocks in RAM): same
+  tokens as the strict baseline, 0.77 GB of weights in VRAM, prefill overlap efficiency
+  0.90-1.00; 2.28 s/token against 2.88 with `accelerate` offloading, at a third of its peak VRAM.
+- Known limitation: Qwen3-0.6B does not reach 80 % prefill efficiency with long prompts (about
+  0.7 with 2048 and 4096 tokens): `lm_head` is 26 % of its bytes and has no compute to hide it.
+- Left open by F1, now under milestone F4: issue #4 (a copy waits behind an unrelated disk read
+  when some blocks are in RAM and some on disk).
+- No stable public API yet — do not invent one beyond the roadmap.
+- Phases (the numbers are names; the order is the one above): F0 foundations; F1 ping-pong
+  layer streaming + NVMe tier; F2 TurboQuant KV cache + Triton kernels; F3 video diffusion
+  (sequential pipeline, chunking, VAE tiling); F4 MoE expert cache + planner; F5 v0.1.0 release.
 - Design docs live in `docs/` (Spanish, **local only, gitignored**): `arquitectura-y-roadmap.md`,
   `estado-del-arte-2025-2026.md`. Read them before architectural work; never commit them.
 
@@ -80,10 +92,7 @@ Create modules only when the current phase needs them.
    `t ≈ max(c, x) + (1 − e)·min(c, x)` (`c` compute, `x` transfer, `e` copy/compute overlap
    efficiency). Take `e` from `bench_hw` on the target machine, never hard-code it:
    ≈ 0.95 on native Linux, ≈ 0.7 on WSL2 for copies ≥ 64 MiB (issue #1).
-   The CPU is a link too, and a faster one: it reads weights from RAM at ≈ 36 GB/s on the
-   reference laptop, against 6.7 GB/s over PCIe. Qwen3-8B decodes at 0.45 s/token on the CPU
-   and 2.33 s/token streamed (one token per pass: nothing hides the copies), while a prefill of
-   512 tokens takes 81 s on the CPU and 2.3 s streamed.
+   RAM → CPU is a link too, and the fastest one: see decision 8.
 2. **KV cache = TurboQuant-MSE** (random rotation + Lloyd-Max codebook per coordinate, calibration-free).
    **QJL residual is OFF by default** (hurts softmax attention at equal bit budget; arXiv:2605.08114).
    Give keys more bits than values. Keep boundary layers and a recent-token window in fp16.
@@ -127,6 +136,15 @@ Create modules only when the current phase needs them.
 7. **Native Linux first.** Development and benchmarks run on native Linux only; WSL2 is no longer
    used for either. WSL2 stays **supported for users**: `setup_linux.sh` and telemetry detect it
    (`is_wsl()`), and `bench_hw` labels its results. Native Windows only via the PyTorch fallback.
+
+8. **The CPU is a compute tier.** A block whose weights are in RAM can be computed where they
+   are: the CPU reads them at ≈ 36 GB/s on the reference laptop, against 6.7 GB/s over PCIe.
+   Measured with `bench_llm` on Qwen3-8B: one token per pass takes 0.45 s on the CPU and 2.28 s
+   streamed (nothing hides the copies); 512 tokens take 81 s on the CPU and 2.3 s streamed.
+   The crossover is at ≈ 13 tokens per pass, an estimate interpolated between those two CPU
+   measurements. Below it, compute on the CPU the blocks that are in RAM; above it, stream
+   them to the GPU. The F4 planner will choose the compute device per block and per phase
+   (prefill, decoding). First case: `lm_head` on the CPU while decoding.
 
 ## Coding conventions
 
