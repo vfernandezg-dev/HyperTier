@@ -108,25 +108,33 @@ class PinnedPool:
         """Bytes handed out since the last reset, alignment padding included."""
         return sum(seg.used for seg in self._segments)
 
-    def alloc(self, nbytes: int) -> torch.Tensor:
-        """Contiguous pinned ``uint8`` view of ``nbytes``, starting on an ``ALIGN`` boundary.
+    def alloc(self, nbytes: int, *, align: int = ALIGN) -> torch.Tensor:
+        """Contiguous pinned ``uint8`` view of ``nbytes``, starting on an ``align`` boundary.
 
-        The memory is not zeroed. Its contents are yours until the pool is reset.
+        ``align`` is a multiple of ``ALIGN`` up to the page size; a buffer that ``O_DIRECT``
+        reads land in needs the page size. The memory is not zeroed. Its contents are yours
+        until the pool is reset.
         """
         if self._closed:
             raise RuntimeError("the pool is closed")
         if nbytes < 0:
             raise ValueError(f"nbytes must be >= 0, got {nbytes}")
+        if align % ALIGN or mmap.PAGESIZE % align:
+            raise ValueError(f"align must be a multiple of {ALIGN} that divides the page size")
         size = align_up(nbytes)
         for seg in self._segments:
-            if seg.size - seg.used >= size:
+            start = align_up(seg.used, align)
+            if seg.size - start >= size:
                 break
         else:
             if size == 0:
                 return self._torch.empty(0, dtype=self._torch.uint8)
             seg = self._grow(max(self.segment_bytes, size))
-        view = seg.tensor[seg.used : seg.used + nbytes]
-        seg.used += size
+            start = 0
+        if seg.tensor.data_ptr() % align:  # only PyTorch's own allocator could do this
+            raise RuntimeError(f"pinned segment is not {align}-byte aligned")
+        view = seg.tensor[start : start + nbytes]
+        seg.used = start + size
         return view
 
     def reset(self) -> None:
