@@ -31,6 +31,8 @@ PyTorch, so the policy is tested on machines without it.
 from __future__ import annotations
 
 import statistics
+import threading
+import time
 import warnings
 from collections import deque
 from collections.abc import Collection, Iterable
@@ -39,6 +41,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from hypertier.stream.pinned import ALIGN, PinnedPool, align_up
+from hypertier.stream.source import FileBackend, FileWeights, Permit
 from hypertier.telemetry._common import (
     MiB,
     format_bytes,
@@ -46,7 +49,7 @@ from hypertier.telemetry._common import (
     require_cuda,
     resolve_device,
 )
-from hypertier.telemetry.bandwidth import overlap_efficiency
+from hypertier.telemetry.bandwidth import overlap_efficiency, percentile
 
 if TYPE_CHECKING:
     import torch
@@ -218,6 +221,18 @@ class PassStats:
     total_ms: float  # first block reached -> last block or last copy finished
     # overlap_efficiency(copy, compute, total): an upper bound (see above); None without copies
     efficiency: float | None
+    # Weights read from files (zero when they were already in memory):
+    read_ms: float = 0.0  # disk reads that fed the copies of this pass
+    bytes_read: int = 0
+    read_stall_ms: float = 0.0  # host time the model waited for the reader thread
+    # From asking for a copy to having it enqueued, per block. With a reader thread this
+    # includes waiting for a disk read that is not finished, which nothing can shorten.
+    enqueue_ms: float = 0.0  # median
+    enqueue_p99_ms: float = 0.0
+    # The part of it spent with the bytes already in RAM: the reader was busy with something
+    # else (a read request for another block). A second thread could remove only this.
+    handoff_ms: float = 0.0  # median
+    handoff_p99_ms: float = 0.0
 
 
 @dataclass
@@ -225,25 +240,32 @@ class _PassRecord:
     """Events of a pass that the GPU may still be executing."""
 
     compute: list[list[Any]] = field(default_factory=list)  # [reached, started, finished]
-    copies: list[tuple[Any, Any]] = field(default_factory=list)  # (started, finished)
-    misses: int = 0
-    bytes_copied: int = 0
+    copies: list[Permit] = field(default_factory=list)  # asked for during the pass
+    read_stall_ms: float = 0.0
 
 
 class _TimingEvents:
-    """Recycles timing events: a pass needs five per block, every pass."""
+    """Recycles timing events: a pass needs five per block, every pass.
+
+    Shared with the reader thread, which times the copies it enqueues.
+    """
 
     def __init__(self, torch: Any) -> None:
         self._torch = torch
         self._idle: list[Any] = []
+        self._lock = threading.Lock()
 
     def record(self, stream: Any) -> Any:
-        event = self._idle.pop() if self._idle else self._torch.cuda.Event(enable_timing=True)
+        with self._lock:
+            event = self._idle.pop() if self._idle else None
+        if event is None:
+            event = self._torch.cuda.Event(enable_timing=True)
         event.record(stream)
         return event
 
     def recycle(self, events: Iterable[Any]) -> None:
-        self._idle.extend(events)
+        with self._lock:
+            self._idle.extend(events)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -305,6 +327,10 @@ class LayerStreamer:
         pool: page-locked RAM to take the weights from. Default: a private pool that grows as
             blocks move in. Pass one to pay the pinning cost once across several models.
         telemetry: time every pass with CUDA events (see :meth:`pass_stats`).
+        weights: read the weights from safetensors files instead of taking them from the
+            modules (:class:`~hypertier.stream.source.FileWeights`). Blocks that do not fit in
+            its RAM budget are read from disk on every pass by a reader thread, and a block's
+            parameters are ``meta`` placeholders outside its forward.
 
     While attached, streamed parameters have ``requires_grad=False`` (a slot is overwritten
     right after its block ran, so gradients could not be computed), and the blocks' buffers
@@ -338,6 +364,7 @@ class LayerStreamer:
         device: torch.device | str = "cuda",
         pool: PinnedPool | None = None,
         telemetry: bool = True,
+        weights: FileWeights | None = None,
     ) -> None:
         torch = require_cuda()
         modules = list(blocks)
@@ -360,7 +387,11 @@ class LayerStreamer:
         self.vram_bytes = 0
         """VRAM held while attached: the slots plus the blocks' buffers."""
         self.streamed_bytes = 0
-        """Bytes of weights kept in page-locked RAM and streamed on demand."""
+        """Bytes of weights streamed through the slots on demand."""
+        self.ram_bytes = 0
+        """Page-locked RAM the weights take: RAM-tier blocks plus staging buffers."""
+        self.tiers: tuple[str, ...] = ()
+        """Per block, ``"ram"`` (kept in page-locked RAM) or ``"nvme"`` (read every pass)."""
 
         self._torch = torch
         self._device = dev
@@ -374,6 +405,13 @@ class LayerStreamer:
         self._params: list[list[Any]] = []
         self._host_views: list[list[Any]] = []
         self._regions: list[Any] = []
+        self._src: list[list[Any]] = []  # per block, what the main thread copies from
+        self._weights = weights
+        self._backend: FileBackend | None = None
+        self._reader: Any = None  # the thread that enqueues copies, with weights from files
+        self._free_gen: list[int] = []  # how many times slot_free / slot_ready were recorded
+        self._ready_gen: list[int] = []
+        self._slot_permit: list[Permit | None] = []  # the copy last asked for, per slot
         self._grad_flags: list[tuple[Any, bool]] = []
         self._moved_buffers: list[tuple[Any, str, Any]] = []
         self._slots: list[Any] = []
@@ -395,7 +433,7 @@ class LayerStreamer:
             # Outside inference mode, whatever the caller's mode: an inference tensor could
             # not back a parameter that is later used in a normal forward.
             with torch.inference_mode(False), torch.no_grad():
-                self._build(slots, pool)
+                self._build(slots, pool, weights)
         except BaseException:
             self._teardown()
             raise
@@ -443,10 +481,14 @@ class LayerStreamer:
     # -----------------------------------------------------------------------------------------
     # Construction and teardown
 
-    def _build(self, slots: int, pool: PinnedPool | None) -> None:
+    def _build(self, slots: int, pool: PinnedPool | None, weights: FileWeights | None) -> None:
         torch = self._torch
         dev = self._device
-        layouts, sizes = _plan_layout(torch, self._blocks)
+        plans = None if weights is None else weights.plan(torch, self._blocks)
+        if plans is None:
+            layouts, sizes = _plan_layout(torch, self._blocks)
+        else:
+            layouts, sizes = _file_layout(self._blocks, weights.prefixes, plans)
         largest = max(sizes)
         median = statistics.median(sizes)
         if median > 0 and largest > _OVERSIZE_RATIO * median:
@@ -471,14 +513,90 @@ class LayerStreamer:
         self._pool = pool
         self._leased = True
 
+        where = [_locations(block) for block in self._blocks]
+        if plans is None:
+            self._pin_modules(layouts, sizes, pool)
+            self.tiers = ("ram",) * len(sizes)
+            self.ram_bytes = sum(sizes)
+            # At rest a block keeps its own Parameter objects, now backed by the pool.
+            at_rest = [[param for param, _, _ in entries] for entries in layouts]
+        else:
+            # Reads the RAM tier into the pool and reserves the staging buffers.
+            self._backend = FileBackend(self, weights, plans, pool)
+            self.tiers, self.ram_bytes = self._backend.tiers, self._backend.ram_bytes
+            # At rest a block has no memory at all: meta tensors of the real shape and dtype.
+            at_rest = [[_placeholder(torch, p) for p, _, _ in entries] for entries in layouts]
+            self._load_buffers(weights.prefixes)
+        self._unbind = [
+            _swap(torch, [(where[i][id(p)], rest) for (p, _, _), rest in zip(entries, at_rest[i])])
+            for i, entries in enumerate(layouts)
+        ]
+        for swap in self._unbind:
+            _apply(swap)  # with weights from files, this drops whatever the modules held
+
+        resident = self._move_buffers()
+
+        self._slots = [
+            torch.empty(largest, dtype=torch.uint8, device=dev) for _ in range(table.num_slots)
+        ]
+        if largest and any(slot.data_ptr() % ALIGN for slot in self._slots):
+            raise RuntimeError(f"VRAM slot is not {ALIGN}-byte aligned")
+        # Every (slot, block) parameter is made here, once: the hooks only swap them in, and
+        # the reader thread only copies into the views below. Neither allocates on the GPU.
+        self._bind = [
+            [
+                _swap(
+                    torch,
+                    [
+                        (where[i][id(p)], _slot_parameter(torch, slot, off, n, rest))
+                        for (p, off, n), rest in zip(entries, at_rest[i])
+                    ],
+                )
+                for i, entries in enumerate(layouts)
+            ]
+            for slot in self._slots
+        ]
+        if plans is None:
+            self._slot_dst = [[[slot[:size]] for size in sizes] for slot in self._slots]
+        else:
+            self._slot_dst = [
+                [[slot[dst : dst + n] for _, dst, n in plan.spans] for plan in plans]
+                for slot in self._slots
+            ]
+        self.vram_bytes = table.num_slots * largest + resident
+
+        self._copy_stream = torch.cuda.Stream(device=dev)
+        # Without timing: these only order the two streams, which is cheaper to wait on.
+        self._ready = [torch.cuda.Event(enable_timing=False) for _ in self._slots]
+        self._free = [torch.cuda.Event(enable_timing=False) for _ in self._slots]
+        self._free_gen = [0] * table.num_slots
+        self._ready_gen = [0] * table.num_slots
+        self._slot_permit = [None] * table.num_slots
+
+        for index, block in enumerate(self._blocks):
+            self._hooks.append(
+                block.register_forward_pre_hook(partial(self._enter, index), prepend=True)
+            )
+            # always_call: the slot must be released even when the block raises.
+            self._hooks.append(
+                block.register_forward_hook(partial(self._exit, index), always_call=True)
+            )
+        if self._backend is not None:
+            self._reader = self._backend.reader
+            self._reader.start()
+        for load in table.prime():
+            self._issue(load, None)
+
+    def _pin_modules(self, layouts: list[Any], sizes: list[int], pool: PinnedPool) -> None:
+        """Move the modules' own weights into the pool, laid out like a slot."""
         # One block at a time: assigning ``param.data`` drops the last reference to the
-        # original storage, so RAM never holds much more than the model plus one block. The
-        # module keeps its own Parameter objects, now backed by the pool.
+        # original storage, so RAM never holds much more than the model plus one block.
         for entries, size in zip(layouts, sizes):
             region = pool.alloc(size)
             params: list[Any] = []
             views: list[Any] = []
             self._regions.append(region)
+            self._src.append([region])
             self._params.append(params)
             self._host_views.append(views)
             for param, offset, nbytes in entries:
@@ -490,50 +608,23 @@ class LayerStreamer:
                 params.append(param)
                 views.append(view)
 
-        resident = self._move_buffers()
-
-        self._slots = [
-            torch.empty(largest, dtype=torch.uint8, device=dev) for _ in range(table.num_slots)
-        ]
-        if largest and any(slot.data_ptr() % ALIGN for slot in self._slots):
-            raise RuntimeError(f"VRAM slot is not {ALIGN}-byte aligned")
-        # Every (slot, block) parameter is made here, once: the hooks only swap them in.
-        where = [_locations(block) for block in self._blocks]
-        self._unbind = [
-            _swap(torch, [(where[i][id(p)], p) for p, _, _ in entries])
-            for i, entries in enumerate(layouts)
-        ]
-        self._bind = [
-            [
-                _swap(
-                    torch,
-                    [
-                        (where[i][id(p)], _slot_parameter(torch, slot, off, n, p))
-                        for p, off, n in entries
-                    ],
-                )
-                for i, entries in enumerate(layouts)
-            ]
-            for slot in self._slots
-        ]
-        self._slot_dst = [[slot[:size] for size in sizes] for slot in self._slots]
-        self.vram_bytes = table.num_slots * largest + resident
-
-        self._copy_stream = torch.cuda.Stream(device=dev)
-        # Without timing: these only order the two streams, which is cheaper to wait on.
-        self._ready = [torch.cuda.Event(enable_timing=False) for _ in self._slots]
-        self._free = [torch.cuda.Event(enable_timing=False) for _ in self._slots]
-
-        for index, block in enumerate(self._blocks):
-            self._hooks.append(
-                block.register_forward_pre_hook(partial(self._enter, index), prepend=True)
-            )
-            # always_call: the slot must be released even when the block raises.
-            self._hooks.append(
-                block.register_forward_hook(partial(self._exit, index), always_call=True)
-            )
-        for load in table.prime():
-            self._copy(load)
+    def _load_buffers(self, prefixes: Any) -> None:
+        """Take the blocks' persistent buffers from the checkpoint; they stay on the device."""
+        for number, (block, prefix) in enumerate(zip(self._blocks, prefixes)):
+            for path, module in block.named_modules():
+                for key, buf in module._buffers.items():
+                    name = f"{prefix}{path}.{key}" if path else prefix + key
+                    stored = None if buf is None else self._backend.read_buffer(name)
+                    if stored is None:
+                        continue
+                    if stored.shape != buf.shape or stored.dtype != buf.dtype:
+                        raise ValueError(
+                            f"block {number}: buffer {name!r} is {stored.dtype} "
+                            f"{list(stored.shape)} in the checkpoint, but the module expects "
+                            f"{buf.dtype} {list(buf.shape)}"
+                        )
+                    self._moved_buffers.append((module, key, buf.device))
+                    module._buffers[key] = stored.to(self._device)
 
     def _move_buffers(self) -> int:
         """Make the blocks' buffers resident on the device; return their size in bytes."""
@@ -561,6 +652,8 @@ class LayerStreamer:
         for hook in self._hooks:
             hook.remove()
         self._hooks.clear()
+        if self._backend is not None:
+            self._backend.reader.stop()  # no copy is enqueued after this
         if self._copy_stream is not None:
             # A queued copy still reads the pool and writes a slot, and queued kernels still
             # read the slots: nothing below may be released before both streams are idle.
@@ -585,9 +678,13 @@ class LayerStreamer:
         for state in (
             self._grad_flags, self._moved_buffers, self._params, self._host_views,
             self._regions, self._slots, self._bind, self._unbind, self._slot_dst, self._ready,
-            self._free,
+            self._free, self._src, self._slot_permit,
         ):
             state.clear()
+        if self._backend is not None:
+            self._backend.close()  # after the streams are idle: copies read its buffers
+            self._backend = None
+        self._reader = None
         self._copy_stream = None
         if self._leased and self._pool is not None:
             self._pool._detach()
@@ -614,7 +711,21 @@ class LayerStreamer:
             self._last_block = index
             record = self._pass
         for load in loads:
-            self._copy(load)
+            self._issue(load, record)
+        permit = self._slot_permit[slot]
+        if permit.done is not None:
+            # Host order first: the reader must have recorded slot_ready before compute is
+            # told to wait for it, or it would wait for the slot's previous copy.
+            late = not permit.done.is_set()
+            t0 = time.perf_counter() if late else 0.0
+            self._reader.wait(permit)
+            if late and record is not None:
+                record.read_stall_ms += (time.perf_counter() - t0) * 1e3
+        if permit.ready_gen != self._ready_gen[slot]:
+            raise RuntimeError(
+                f"slot {slot}: slot_ready is at generation {self._ready_gen[slot]}, but the "
+                f"copy of block {index} recorded {permit.ready_gen}"
+            )
         timing = None
         if record is not None:
             reached = self._events.record(compute)
@@ -640,26 +751,42 @@ class LayerStreamer:
             timing[2] = self._events.record(compute)
         # Every kernel of the block is enqueued by now: the slot is free once they finish.
         self._free[slot].record(compute)
+        self._free_gen[slot] += 1  # before the table can hand the slot to another block
         _apply(self._unbind[index])
         self._table.exit(index)
 
-    def _copy(self, load: Load) -> None:
-        """Enqueue the copy of a block into its slot, behind the slot's last reader."""
+    def _issue(self, load: Load, record: _PassRecord | None) -> None:
+        """Ask for the copy of a block into its slot, whose last user has recorded slot_free.
+
+        With weights in memory the main thread enqueues it here. With weights from files it
+        becomes a permit for the reader thread, which enqueues it once the bytes are in RAM.
+        """
+        slot, nbytes = load.slot, self._sizes[load.block]
+        permit = Permit(
+            load.block, slot, load.demand, nbytes, self._free_gen[slot], time.perf_counter(),
+            timed=record is not None and nbytes > 0,
+        )
+        self._slot_permit[slot] = permit
+        if record is not None:
+            record.copies.append(permit)
+        if self._reader is not None:
+            permit.done = threading.Event()
+            self._reader.issue(permit)
+            return
         stream = self._copy_stream
-        nbytes = self._sizes[load.block]
-        stream.wait_event(self._free[load.slot])  # the copy waits for compute
-        record = self._pass if nbytes else None
-        started = self._events.record(stream) if record is not None else None
+        stream.wait_event(self._free[slot])  # the copy waits for compute
+        if permit.timed:
+            permit.started = self._events.record(stream)
         if nbytes:
             with self._torch.cuda.stream(stream):
-                self._slot_dst[load.slot][load.block].copy_(
-                    self._regions[load.block], non_blocking=True
-                )
-        self._ready[load.slot].record(stream)
-        if record is not None:
-            record.copies.append((started, self._events.record(stream)))
-            record.bytes_copied += nbytes
-            record.misses += load.demand
+                for dst, src in zip(self._slot_dst[slot][load.block], self._src[load.block]):
+                    dst.copy_(src, non_blocking=True)
+        self._ready[slot].record(stream)
+        self._ready_gen[slot] += 1
+        permit.ready_gen = self._ready_gen[slot]
+        if permit.timed:
+            permit.finished = self._events.record(stream)
+        permit.enqueued = permit.available = time.perf_counter()
 
     # -----------------------------------------------------------------------------------------
     # Telemetry
@@ -681,8 +808,17 @@ class LayerStreamer:
             pending.popleft()
 
     def _finish(self, record: _PassRecord, wait: bool) -> bool:
+        # A copy asked for at the end of a pass may not have been enqueued by the reader yet.
+        unserved = [c for c in record.copies if c.done is not None and not c.done.is_set()]
+        if unserved and not wait:
+            return False
+        for permit in unserved:
+            self._reader.settle(permit)
+        copies = [c for c in record.copies if c.finished is not None]
         compute = [t for t in record.compute if t[2] is not None]
-        tails = [t[2] for t in compute[-1:]] + [c[1] for c in record.copies[-1:]]
+        tails = [t[2] for t in compute[-1:]]
+        if copies:
+            tails.append(max(copies, key=lambda c: c.enqueued).finished)
         if wait:
             for event in tails:
                 event.synchronize()
@@ -690,27 +826,36 @@ class LayerStreamer:
             return False
         if compute:
             start = compute[0][0]
-            copy_ms = sum(a.elapsed_time(b) for a, b in record.copies)
+            copy_ms = sum(c.started.elapsed_time(c.finished) for c in copies)
             compute_ms = sum(started.elapsed_time(done) for _, started, done in compute)
             total_ms = max(start.elapsed_time(event) for event in tails)
             efficiency = None
             if copy_ms > 0 and compute_ms > 0:
                 efficiency = overlap_efficiency(copy_ms, compute_ms, total_ms)
+            latency = [(c.enqueued - c.issued) * 1e3 for c in copies]
+            handoff = [(c.enqueued - c.available) * 1e3 for c in copies]
             self._history.append(
                 PassStats(
                     blocks=len(compute),
-                    copies=len(record.copies),
-                    misses=record.misses,
-                    bytes_copied=record.bytes_copied,
+                    copies=len(copies),
+                    misses=sum(c.demand for c in copies),
+                    bytes_copied=sum(c.nbytes for c in copies),
                     copy_ms=copy_ms,
                     compute_ms=compute_ms,
                     stall_ms=sum(reached.elapsed_time(started) for reached, started, _ in compute),
                     total_ms=total_ms,
                     efficiency=efficiency,
+                    read_ms=sum(c.read_ms for c in copies),
+                    bytes_read=sum(c.bytes_read for c in copies),
+                    read_stall_ms=record.read_stall_ms,
+                    enqueue_ms=percentile(latency, 50.0) if latency else 0.0,
+                    enqueue_p99_ms=percentile(latency, 99.0) if latency else 0.0,
+                    handoff_ms=percentile(handoff, 50.0) if handoff else 0.0,
+                    handoff_p99_ms=percentile(handoff, 99.0) if handoff else 0.0,
                 )
             )
         self._events.recycle(e for t in record.compute for e in t if e is not None)
-        self._events.recycle(e for pair in record.copies for e in pair)
+        self._events.recycle(e for c in copies for e in (c.started, c.finished))
         return True
 
 
@@ -742,6 +887,35 @@ def _plan_layout(
         layouts.append(entries)
         sizes.append(offset)
     return layouts, sizes
+
+
+def _file_layout(
+    modules: list[Any], prefixes: Any, plans: Any
+) -> tuple[list[list[tuple[Any, int, int]]], list[int]]:
+    """The layout of :func:`_plan_layout`, in the order the tensors have in their files."""
+    owner: dict[int, int] = {}
+    layouts: list[list[tuple[Any, int, int]]] = []
+    for index, (block, prefix, plan) in enumerate(zip(modules, prefixes, plans)):
+        params = dict(block.named_parameters())
+        entries = []
+        for tensor, offset in plan.entries:
+            param = params[tensor.name[len(prefix) :]]
+            if owner.setdefault(id(param), index) != index:
+                raise ValueError(
+                    f"parameter {tensor.name!r} of block {index} also belongs to block "
+                    f"{owner[id(param)]}; streamed blocks cannot share parameters"
+                )
+            entries.append((param, offset, tensor.nbytes))
+        layouts.append(entries)
+    return layouts, [plan.size for plan in plans]
+
+
+def _placeholder(torch: Any, param: Any) -> Any:
+    """What a file-backed parameter is while its block is not loaded: shape, dtype, no memory."""
+    if param.device.type == "meta":
+        return param
+    empty = torch.empty(param.shape, dtype=param.dtype, device="meta")
+    return torch.nn.Parameter(empty, requires_grad=False)
 
 
 def _typed_view(buffer: Any, offset: int, nbytes: int, like: Any) -> Any:
