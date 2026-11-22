@@ -168,6 +168,9 @@ def test_weights_are_placed_by_how_they_are_used(transformers, disk_tmp):
         assert model.model.rotary_emb.inv_freq.device.type == "cuda"
         assert not any(p.requires_grad for p in model.parameters())
         assert streamer.num_blocks == 5 + len(streamed.head_rows)
+        # Everything streamed is in RAM here: no reader thread stands between the model
+        # asking for a copy and the copy being enqueued.
+        assert "hypertier-reader" not in [t.name for t in __import__("threading").enumerate()]
         assert streamed.head_rows[0][0] == 0 and streamed.head_rows[-1][1] == 1500
         # VRAM for weights: the slots and a few hundred bytes of norm and rotary tables.
         assert streamed.resident_bytes == 64 * 2 + 2 * 8 * 4

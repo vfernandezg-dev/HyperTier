@@ -567,7 +567,8 @@ def test_random_delays_in_both_threads_never_change_a_bit(
     weights = FileWeights(disk_tmp, block_prefixes(model), ram_budget=limit, num_stage=num_stage)
     with LayerStreamer(model.blocks, slots=slots, weights=weights) as streamer, torch.no_grad():
         want = reference(x)
-        streamer._reader.tick = nap  # before a read, between requests, around every copy
+        if streamer._reader is not None:  # there is none with every block in RAM
+            streamer._reader.tick = nap  # before a read, between requests, around every copy
         for block in model.blocks:
             block.register_forward_pre_hook(nap, prepend=True)  # before the streamer's hook
             block.register_forward_hook(nap)  # and after it
@@ -610,7 +611,36 @@ def test_pass_stats_account_for_reads_and_hand_off(disk_tmp, safetensors_writer)
             if tier == "nvme":
                 assert s.bytes_read == 7 * on_disk and s.read_ms > 0
             else:
-                assert s.bytes_read == 0 and s.read_ms == 0 and s.read_stall_ms < 50
+                assert s.bytes_read == 0 and s.read_ms == 0 and s.read_stall_ms == 0
+                # No thread to hand the copy to: all of it is the main thread enqueueing.
+                assert 0 < s.handoff_ms == s.enqueue_ms and s.handoff_p99_ms == s.enqueue_p99_ms
+                assert s.enqueue_p99_ms < 5
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("tier", ["ram", "mixed", "nvme"])
+def test_the_reader_thread_exists_only_when_a_block_comes_from_disk(
+    disk_tmp, safetensors_writer, tier
+):
+    import torch
+
+    model = toy_mlp(7, 64)
+    x = torch.randn(5, 64, device="cuda")
+    expected = resident_outputs(model, x, passes=3)
+    save(disk_tmp, model, safetensors_writer)
+    limit = budget(disk_tmp, model, tier, 2)
+    weights = FileWeights(disk_tmp, block_prefixes(model), ram_budget=limit)
+    with LayerStreamer(model.blocks, weights=weights) as streamer, torch.no_grad():
+        readers = [t for t in threading.enumerate() if t.name == "hypertier-reader"]
+        assert len(readers) == (0 if tier == "ram" else 1)
+        assert (streamer._reader is None) == (tier == "ram")
+        y = x
+        for want in expected:
+            y = model(y)
+            assert torch.equal(y, want)
+        stats = streamer.pass_stats()
+        assert all(s.copies == 7 for s in stats[1:])
+    assert "hypertier-reader" not in [thread.name for thread in threading.enumerate()]
 
 
 @pytest.mark.cuda
