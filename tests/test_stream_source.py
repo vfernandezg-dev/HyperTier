@@ -12,6 +12,7 @@ import copy
 import random
 import threading
 import time
+from array import array
 
 import pytest
 from toys import checkpoint_tensors, resident_outputs, toy_mlp, toy_transformer
@@ -20,7 +21,14 @@ from hypertier.io import SafetensorsIndex
 from hypertier.stream import FileWeights, LayerStreamer
 from hypertier.stream.pingpong import SlotTable
 from hypertier.stream.pinned import ALIGN
-from hypertier.stream.source import Permit, Reader, merge_spans, plan_block, plan_tiers
+from hypertier.stream.source import (
+    Permit,
+    Reader,
+    converted_nbytes,
+    merge_spans,
+    plan_block,
+    plan_tiers,
+)
 from hypertier.telemetry import MiB
 
 PAGE = 4096
@@ -129,6 +137,57 @@ def test_a_block_can_be_a_range_of_rows_of_a_larger_tensor(tmp_path, safetensors
     piece = index["head.weight"].rows(0, 8)
     with pytest.raises(ValueError, match="same bytes"):
         plan_block({"weight": piece, "again": piece})
+
+
+def assemble_converted(plan) -> bytearray:
+    """What the streamer does with a converted plan, in plain Python (float32 to float64)."""
+    scratch = bytearray(plan.scratch_bytes)
+    for run, base, length in plan.reads:
+        start = run.offset // PAGE * PAGE
+        with open(run.path, "rb") as f:
+            f.seek(start)
+            data = f.read(length)
+        scratch[base : base + len(data)] = data
+    host = bytearray(plan.host_bytes)
+    for source, offset, nbytes, stored, target in plan.casts:
+        data = bytes(scratch[source : source + nbytes])
+        if stored != target:
+            assert (stored, target) == ("F32", "F64")
+            data = array("d", array("f", data)).tobytes()
+        host[offset : offset + len(data)] = data
+    slot = bytearray(plan.size)
+    for src, dst, nbytes in plan.spans:
+        slot[dst : dst + nbytes] = host[src : src + nbytes]
+    return slot
+
+
+def test_a_converted_block_is_laid_out_by_the_dtype_it_runs_in(tmp_path, safetensors_writer):
+    floats = [array("f", [0.25 * i - 3 for i in range(n)]) for n in (75, 64, 3)]
+    block = {
+        "b.0": ("F32", (75,), floats[0].tobytes()),  # 300 bytes stored, 600 in the slot
+        "b.1": ("F32", (64,), floats[1].tobytes()),
+        "b.2": ("U8", (50,), blob(3, 50)),  # not converted: copied as it is
+        "b.3": ("F32", (3,), floats[2].tobytes()),
+    }
+    other = {"a.weight": ("U8", (700,), blob(99, 700))}
+    index = SafetensorsIndex(safetensors_writer(tmp_path / "m.safetensors", {**other, **block}))
+    tensors = {name: index[name] for name in block}
+    plan = plan_block(tensors, {"b.0": "F64", "b.1": "F64", "b.3": "F64"})
+
+    assert [offset for _, offset in plan.entries] == [0, 768, 1280, 1536]
+    assert plan.size == 1792, "sized by what the tensors take in the slot"
+    assert plan.host_bytes == plan.size and plan.spans == ((0, 0, 1792),), "one copy to VRAM"
+    assert len(plan.reads) == 1 and plan.scratch_bytes == plan.reads[0][2] >= 300 + 256 + 62
+    slot = assemble_converted(plan)
+    for (_, offset), values in zip([plan.entries[i] for i in (0, 1, 3)], floats):
+        assert array("d", bytes(slot[offset : offset + 8 * len(values)])) == array("d", values)
+    assert bytes(slot[1280:1330]) == blob(3, 50)
+
+    same = plan_block(tensors)
+    assert same.casts == () and same.scratch_bytes == 0 and same.size == 1280
+    assert converted_nbytes(index["b.0"], "BF16") == 150
+    with pytest.raises(ValueError, match="not in the block"):
+        plan_block(tensors, {"b.9": "F64"})
 
 
 # ---------------------------------------------------------------------------------------------
@@ -703,6 +762,159 @@ def test_persistent_buffers_are_taken_from_the_checkpoint(disk_tmp, safetensors_
         for block, ref in zip(skeleton.blocks, reference.blocks):
             y, want = block(y), ref(want)
         assert torch.equal(y, want)
+
+
+def runs_in(model, dtype):
+    """``model`` as a normal load in ``dtype`` gives it: converted on the CPU."""
+    import torch
+
+    return copy.deepcopy(model).to(getattr(torch, dtype))
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    ("stored", "dtype", "shards", "slots"),
+    [
+        ("float32", "bfloat16", 1, 2), ("float32", "float16", 2, 2), ("float32", "float64", 1, 1),
+        ("bfloat16", "float32", 3, 3),
+    ],
+)  # fmt: skip
+def test_a_checkpoint_in_another_dtype_is_converted_while_loading(
+    disk_tmp, safetensors_writer, stored, dtype, shards, slots
+):
+    import torch
+
+    trained = runs_in(toy_transformer(5), stored)
+    save(disk_tmp, trained, safetensors_writer, shards=shards)
+    reference = runs_in(trained, dtype)
+    x = torch.randn(4, 33, 100, device="cuda", dtype=getattr(torch, dtype))
+    expected = resident_outputs(reference, x, passes=2)
+
+    model = runs_in(trained, dtype)
+    with torch.no_grad():
+        for param in model.blocks.parameters():
+            param.zero_()  # the values must come from the file, converted
+    model.norm.cuda()
+    seen = []
+    model.blocks[2].register_forward_pre_hook(
+        lambda block, args: seen.append((block.linear1.weight.dtype, block.linear1.weight.device.type))
+    )
+    weights = FileWeights(disk_tmp, block_prefixes(model), cast=True)
+    with LayerStreamer(model.blocks, slots=slots, weights=weights) as streamer:
+        in_slot = sum(
+            -(-p.numel() * p.element_size() // ALIGN) * ALIGN for p in reference.blocks.parameters()
+        )
+        assert streamer.streamed_bytes == streamer.ram_bytes == in_slot, "the converted size"
+        assert set(streamer.tiers) == {"ram"} and streamer._reader is None
+        with torch.no_grad():
+            y = x
+            for want in expected:
+                y = model(y)
+                assert torch.equal(y, want)
+    assert seen and set(seen) == {(getattr(torch, dtype), "cuda")}
+
+
+@pytest.mark.cuda
+def test_a_block_may_keep_some_tensors_in_the_stored_dtype(disk_tmp, safetensors_writer):
+    """Models that run in bf16 often keep norms and small tables in float32."""
+    import torch
+    from torch import nn
+
+    class Block(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.table = nn.Parameter(torch.randn(1, 100))  # 400 bytes: padded in the slot
+            self.fc = nn.Linear(100, 100)
+
+        def forward(self, x):
+            return self.fc((x.float() + self.table).to(x.dtype))
+
+    class Stack(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = nn.ModuleList(Block() for _ in range(4))
+
+        def forward(self, x):
+            for block in self.blocks:
+                x = block(x)
+            return x
+
+    def mixed(model):
+        model = copy.deepcopy(model)
+        for block in model.blocks:
+            block.fc.to(torch.bfloat16)
+        return model
+
+    torch.manual_seed(0)
+    trained = Stack().eval()
+    save(disk_tmp, trained, safetensors_writer)
+    x = torch.randn(8, 100, device="cuda", dtype=torch.bfloat16)
+    expected = resident_outputs(mixed(trained), x, passes=2)
+    model = mixed(trained)
+    weights = FileWeights(disk_tmp, block_prefixes(model), cast=True)
+    with LayerStreamer(model.blocks, weights=weights) as streamer, torch.no_grad():
+        assert streamer.slot_bytes == 512 + 256 + 20224, "table in float32, the rest halved"
+        y = x
+        for want in expected:
+            y = model(y)
+            assert torch.equal(y, want)
+
+
+@pytest.mark.cuda
+def test_persistent_buffers_are_converted_too(disk_tmp, safetensors_writer):
+    import torch
+    from torch import nn
+
+    class Stack(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.blocks = nn.ModuleList(nn.BatchNorm1d(16) for _ in range(3))
+
+    torch.manual_seed(0)
+    trained = Stack().eval()
+    for block in trained.blocks:
+        block.running_mean.normal_()
+        block.running_var.uniform_(0.5, 2.0)
+        block.weight.data.normal_()
+    save(disk_tmp, trained, safetensors_writer)
+    reference = runs_in(trained, "float64").cuda()
+    skeleton = Stack().eval().double()
+    x = torch.randn(8, 16, device="cuda", dtype=torch.float64)
+    weights = FileWeights(disk_tmp, block_prefixes(skeleton), cast=True)
+    with LayerStreamer(skeleton.blocks, weights=weights), torch.no_grad():
+        y, want = x, x
+        for block, ref in zip(skeleton.blocks, reference.blocks):
+            y, want = block(y), ref(want)
+        assert torch.equal(y, want)
+
+
+@pytest.mark.cuda
+def test_conversion_has_to_be_asked_for_and_needs_the_ram_tier(disk_tmp, safetensors_writer):
+    import torch
+    from torch import nn
+
+    model = toy_mlp(3, 64)
+    save(disk_tmp, model, safetensors_writer)
+    prefixes = block_prefixes(model)
+    halved = runs_in(model, "bfloat16").blocks
+
+    def attach(blocks, source=disk_tmp, names=prefixes, **options):
+        return LayerStreamer(blocks, weights=FileWeights(source, names, **options))
+
+    with pytest.raises(ValueError, match="pass cast=True"):
+        attach(halved)
+    plans = FileWeights(disk_tmp, prefixes, cast=True).plan(torch, halved)
+    staging_only = 2 * max(plan.host_bytes for plan in plans)
+    with pytest.raises(ValueError, match="3 converted block"):
+        attach(halved, cast=True, ram_budget=staging_only)
+    # Only floating point converts to floating point: integers would not be the same weights.
+    (disk_tmp / "ints").mkdir()
+    ints = {"blocks.0.weight": ("I64", (4, 4), bytes(128)), "blocks.0.bias": ("F32", (4,), bytes(16))}
+    path = safetensors_writer(disk_tmp / "ints" / "model.safetensors", ints)
+    with pytest.raises(ValueError, match="the module expects") as refused:
+        attach(nn.ModuleList([nn.Linear(4, 4)]), path, ["blocks.0."], cast=True)
+    assert "cast=True" not in str(refused.value)
+    assert "hypertier-reader" not in [thread.name for thread in threading.enumerate()]
 
 
 @pytest.mark.cuda

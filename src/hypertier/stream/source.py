@@ -28,6 +28,11 @@ not only on the device, and that order is the *permit*:
 
 The reader never allocates GPU memory: it copies into slots reserved by the main thread.
 
+A checkpoint stored in another floating-point type than the one the model runs in (a float32
+file run in bfloat16) is *converted* while it is read into the RAM tier, once, on the CPU.
+Such a block has other bytes in RAM than on disk, so it cannot be read from disk on every
+pass: converted blocks live in the RAM tier only.
+
 The engine (:class:`Reader`) and the planning helpers are plain Python; PyTorch is imported
 lazily, so the protocol is tested with fake streams and events on machines without a GPU.
 """
@@ -47,7 +52,13 @@ from os import PathLike
 from typing import TYPE_CHECKING, Any, Protocol
 
 from hypertier.io.direct import DirectReader, aligned_span
-from hypertier.io.safetensors_index import Run, SafetensorsIndex, TensorEntry, runs_of
+from hypertier.io.safetensors_index import (
+    DTYPE_BYTES,
+    Run,
+    SafetensorsIndex,
+    TensorEntry,
+    runs_of,
+)
 from hypertier.stream.pinned import PinnedPool, align_up
 from hypertier.telemetry._common import MiB, format_bytes
 
@@ -439,16 +450,33 @@ class BlockPlan:
     reads: tuple[tuple[Run, int, int], ...]  # (run, where its aligned range goes, its length)
     spans: tuple[tuple[int, int, int], ...]  # copies: (host offset, slot offset, nbytes)
     host_bytes: int  # page-locked bytes the block takes, in RAM or in a staging buffer
+    # A converted block is read into a scratch buffer of ``scratch_bytes`` (that is where
+    # ``reads`` point then) and each tensor is converted from there into page-locked memory
+    # laid out like the slot: (scratch offset, slot offset, stored nbytes, stored dtype,
+    # dtype it runs in). Empty for a block whose bytes are used as they are stored.
+    casts: tuple[tuple[int, int, int, str, str], ...] = ()
+    scratch_bytes: int = 0
 
 
-def plan_block(tensors: Mapping[str, TensorEntry]) -> BlockPlan:
+def plan_block(
+    tensors: Mapping[str, TensorEntry], convert: Mapping[str, str] | None = None
+) -> BlockPlan:
     """Lay a block's tensors out in a slot in file order and work out the reads and copies.
 
     ``tensors`` maps the name the block has for each tensor (its parameter name) to the
     entry that holds its bytes. Each run is read through its block-aligned range; the ranges
     of a block sit one after the other on page boundaries, in a RAM-tier region and in a
     staging buffer alike.
+
+    ``convert`` names the tensors that run in another dtype than they are stored in, with
+    that dtype (a safetensors name such as ``"BF16"``). The slot is then laid out by the
+    sizes the tensors run in, the reads go to a scratch buffer, and the page-locked copy of
+    the block is laid out like the slot, so it is still a single copy to VRAM.
     """
+    convert = convert or {}
+    unknown = sorted(set(convert) - set(tensors))
+    if unknown:
+        raise ValueError(f"cannot convert tensors that are not in the block: {unknown}")
     local = {}
     for name, entry in tensors.items():
         if local.setdefault(entry, name) != name:
@@ -458,6 +486,7 @@ def plan_block(tensors: Mapping[str, TensorEntry]) -> BlockPlan:
     entries: list[tuple[TensorEntry, int]] = []
     reads: list[tuple[Run, int, int]] = []
     pieces: list[tuple[int, int, int, int]] = []
+    casts: list[tuple[int, int, int, str, str]] = []
     slot_offset = 0
     host_offset = 0
     for number, run in enumerate(runs):
@@ -468,12 +497,31 @@ def plan_block(tensors: Mapping[str, TensorEntry]) -> BlockPlan:
             entries.append((entry, slot_offset))
             source = host_offset + entry.offset - start
             pieces.append((number, source, slot_offset, entry.nbytes))
-            slot_offset = align_up(slot_offset + entry.nbytes)
+            target = convert.get(local[entry], entry.dtype)
+            casts.append((source, slot_offset, entry.nbytes, entry.dtype, target))
+            slot_offset = align_up(slot_offset + converted_nbytes(entry, target))
         host_offset += length
+    if convert:
+        # The page-locked copy mirrors the slot: one piece, whatever the file looked like.
+        spans = ((0, 0, slot_offset),) if slot_offset else ()
+        return BlockPlan(
+            tuple(names), tuple(entries), slot_offset, tuple(reads), spans, slot_offset,
+            tuple(casts), host_offset,
+        )  # fmt: skip
     spans = tuple((src, dst, n) for _, src, dst, n in merge_spans(pieces))
     return BlockPlan(
         tuple(names), tuple(entries), slot_offset, tuple(reads), spans, host_offset
     )
+
+
+def converted_nbytes(entry: TensorEntry, dtype: str) -> int:
+    """Bytes ``entry`` takes once its elements are of safetensors dtype ``dtype``."""
+    if dtype == entry.dtype:
+        return entry.nbytes
+    for name in (entry.dtype, dtype):
+        if name not in DTYPE_BYTES:
+            raise ValueError(f"unknown safetensors dtype {name!r} for tensor {entry.name!r}")
+    return entry.nbytes // DTYPE_BYTES[entry.dtype] * DTYPE_BYTES[dtype]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -502,9 +550,16 @@ class FileWeights:
             disk read overlap the copy of the previous block.
         chunk_bytes: size of each read request (see ``DirectReader``).
         direct: force (True) or forbid (False) ``O_DIRECT``; None uses it where possible.
+        cast: convert floating-point tensors stored in another floating-point dtype to the
+            dtype of the module's parameters while they are read into RAM, with the
+            rounding of ``tensor.to(dtype)`` on the CPU. This is how a float32 checkpoint
+            runs in bfloat16 with slots, page-locked RAM and copies of half the size.
+            Without it a dtype that differs is an error. Converted blocks need the RAM
+            tier: a ``ram_budget`` that leaves one of them on disk is an error too.
 
     Bytes moved per pass: as with weights in memory for the copies to VRAM, plus one disk
-    read of every NVMe-tier block.
+    read of every NVMe-tier block. Converting costs nothing per pass: it happens once,
+    while loading, and the copies are of the converted size.
     """
 
     def __init__(
@@ -516,6 +571,7 @@ class FileWeights:
         num_stage: int = 2,
         chunk_bytes: int = 64 * MiB,
         direct: bool | None = None,
+        cast: bool = False,
     ) -> None:
         if num_stage < 1:
             raise ValueError(f"num_stage must be >= 1, got {num_stage}")
@@ -527,6 +583,7 @@ class FileWeights:
         self.num_stage = num_stage
         self.chunk_bytes = chunk_bytes
         self.direct = direct
+        self.cast = cast
 
     def plan(self, torch: Any, blocks: Sequence[nn.Module]) -> list[BlockPlan]:
         """Match every block parameter with its tensor and lay the blocks out."""
@@ -535,6 +592,7 @@ class FileWeights:
         plans = []
         for number, (block, source) in enumerate(zip(blocks, self.prefixes)):
             tensors = {}
+            convert = {}
             for local, param in block.named_parameters():
                 if isinstance(source, str):
                     name = source + local
@@ -545,26 +603,45 @@ class FileWeights:
                 if entry is None:
                     raise ValueError(f"block {number}: tensor {name!r} is not in the checkpoint")
                 dtype = torch_dtype(torch, entry.dtype)
-                if tuple(param.shape) != entry.shape or param.dtype != dtype:
+                castable = dtype.is_floating_point and param.dtype.is_floating_point
+                if tuple(param.shape) != entry.shape or (
+                    param.dtype != dtype and not (self.cast and castable)
+                ):
+                    hint = ""
+                    if tuple(param.shape) == entry.shape and castable:
+                        hint = "; pass cast=True to convert it while loading"
                     raise ValueError(
                         f"block {number}: {name!r} is {entry.dtype} {list(entry.shape)} in the "
                         f"checkpoint, but the module expects {param.dtype} {list(param.shape)}"
+                        + hint
                     )
+                if param.dtype != dtype:
+                    convert[local] = safetensors_dtype(torch, param.dtype)
                 tensors[local] = entry
-            plans.append(plan_block(tensors))
+            plans.append(plan_block(tensors, convert))
         return plans
+
+
+_TORCH_NAMES = {
+    "BF16": "bfloat16", "F16": "float16", "F32": "float32", "F64": "float64",
+    "I64": "int64", "I32": "int32", "I16": "int16", "I8": "int8", "U8": "uint8",
+    "BOOL": "bool",
+}  # fmt: skip
 
 
 def torch_dtype(torch: Any, name: str) -> Any:
     """The torch dtype of a safetensors dtype name."""
-    names = {
-        "BF16": "bfloat16", "F16": "float16", "F32": "float32", "F64": "float64",
-        "I64": "int64", "I32": "int32", "I16": "int16", "I8": "int8", "U8": "uint8",
-        "BOOL": "bool",
-    }  # fmt: skip
-    if name not in names:
+    if name not in _TORCH_NAMES:
         raise ValueError(f"safetensors dtype {name} cannot be streamed")
-    return getattr(torch, names[name])
+    return getattr(torch, _TORCH_NAMES[name])
+
+
+def safetensors_dtype(torch: Any, dtype: Any) -> str:
+    """The safetensors name of a torch dtype: the inverse of :func:`torch_dtype`."""
+    for name, attribute in _TORCH_NAMES.items():
+        if getattr(torch, attribute) == dtype:
+            return name
+    raise ValueError(f"{dtype} has no safetensors dtype that can be streamed")
 
 
 def read_tensor(torch: Any, entry: TensorEntry) -> Any:
@@ -608,17 +685,37 @@ class FileBackend:
         in_ram = plan_tiers(host, max(host), weights.num_stage, weights.ram_budget)
         self.tiers = tuple("ram" if keep else "nvme" for keep in in_ram)
         nvme = [i for i, keep in enumerate(in_ram) if not keep]
+        on_disk = [i for i in nvme if plans[i].casts]
+        if on_disk:
+            raise ValueError(
+                f"ram_budget of {format_bytes(weights.ram_budget)} leaves {len(on_disk)} "
+                f"converted block(s) out of RAM, and a block converted while loading "
+                f"(cast=True) cannot be read from disk on every pass. All of them need "
+                f"{format_bytes(sum(host[i] for i, p in enumerate(plans) if p.casts))} of "
+                "page-locked RAM; to use the NVMe tier, store the checkpoint in the dtype "
+                "it runs in"
+            )
         stage_bytes = max((host[i] for i in nvme), default=0)
         self.ram_bytes = sum(host[i] for i, keep in enumerate(in_ram) if keep)
         self.ram_bytes += weights.num_stage * stage_bytes if nvme else 0
 
         # RAM tier: read once, straight into page-locked memory, and kept.
         self._ram_src: dict[int, list[Any]] = {}
-        for i, keep in enumerate(in_ram):
-            if keep:
+        scratch = _Scratch(max((plan.scratch_bytes for plan in plans), default=0))
+        try:
+            for i, keep in enumerate(in_ram):
+                if not keep:
+                    continue
                 region = pool.alloc(host[i], align=mmap.PAGESIZE)
-                self._fill(i, self._bytes_of(region))
+                if plans[i].casts:
+                    self._keep.append(region)
+                    self._fill(i, scratch.view)
+                    scratch.convert_into(torch, plans[i], region)
+                else:
+                    self._fill(i, self._bytes_of(region))
                 self._ram_src[i] = [region[src : src + n] for src, _, n in plans[i].spans]
+        finally:
+            scratch.close()
         # NVMe tier: every view of every staging buffer is made here, on the main thread.
         self._stage_bytes: list[memoryview] = []
         self._stage_src: list[dict[int, list[Any]]] = []
@@ -721,6 +818,39 @@ class FileBackend:
             return memoryview(bytearray())
         raw = (ctypes.c_ubyte * tensor.numel()).from_address(tensor.data_ptr())
         return memoryview(raw).cast("B")
+
+
+class _Scratch:
+    """Pageable memory a converted block is read into before its tensors are converted.
+
+    One buffer as large as the largest such block, reused for all of them and released when
+    the RAM tier is full. Anonymous ``mmap`` memory starts on a page, which ``O_DIRECT``
+    needs.
+    """
+
+    def __init__(self, nbytes: int) -> None:
+        self._map = mmap.mmap(-1, nbytes) if nbytes else None
+        self.view = memoryview(self._map) if nbytes else memoryview(bytearray())
+
+    def convert_into(self, torch: Any, plan: BlockPlan, region: Any) -> None:
+        """Write every tensor of ``plan``, read into this buffer, where the slot expects it."""
+        for source, offset, nbytes, stored, target in plan.casts:
+            if not nbytes:
+                continue
+            origin = torch_dtype(torch, stored)
+            values = torch.frombuffer(
+                self._map, dtype=origin, count=nbytes // origin.itemsize, offset=source
+            )
+            size = nbytes // DTYPE_BYTES[stored] * DTYPE_BYTES[target]
+            # copy_ converts exactly as Tensor.to(dtype) does on the CPU.
+            region[offset : offset + size].view(torch_dtype(torch, target)).copy_(values)
+            del values  # the mapping cannot be closed while a tensor exports it
+
+    def close(self) -> None:
+        self.view.release()
+        if self._map is not None:
+            self._map.close()
+            self._map = None
 
 
 __all__ = [
