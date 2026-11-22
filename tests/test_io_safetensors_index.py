@@ -8,7 +8,7 @@ import struct
 
 import pytest
 
-from hypertier.io import Run, SafetensorsIndex, TensorEntry
+from hypertier.io import Run, SafetensorsIndex, TensorEntry, runs_of
 from hypertier.io.safetensors_index import MAX_HEADER_BYTES
 
 MiB = 1 << 20
@@ -74,6 +74,41 @@ def test_runs_merge_adjacent_tensors_and_split_at_gaps(tmp_path, safetensors_wri
         index.runs(["missing"])
     with pytest.raises(ValueError):
         index.runs(names, max_gap=-1)
+
+
+def test_rows_of_a_tensor_are_a_contiguous_range_of_its_bytes(tmp_path, safetensors_writer):
+    tensors = {
+        "bias": ("F32", (5,), blob(1, 20)),
+        "table": ("BF16", (10, 3, 2), blob(2, 120)),  # 12 bytes per row
+        "scalar": ("F32", (), blob(3, 4)),
+        "empty": ("F32", (0, 4), b""),
+    }
+    path = safetensors_writer(tmp_path / "m.safetensors", tensors)
+    index = SafetensorsIndex(path)
+    content = path.read_bytes()
+    table = index["table"]
+
+    part = table.rows(2, 7)
+    assert part == TensorEntry("table[2:7]", "BF16", (5, 3, 2), path, table.offset + 24, 60)
+    assert content[part.offset : part.offset + part.nbytes] == tensors["table"][2][24:84]
+    assert table.rows(0, 10).nbytes == table.nbytes and table.rows(4, 4).nbytes == 0
+    assert index["bias"].rows(1, 3).shape == (2,) and index["bias"].rows(1, 3).nbytes == 8
+    assert index["empty"].rows(0, 0).nbytes == 0
+    assert "table[2:7]" not in index, "a range of rows is not added to the index"
+    for start, stop in [(-1, 2), (3, 2), (0, 11)]:
+        with pytest.raises(ValueError, match="outside tensor"):
+            table.rows(start, stop)
+    with pytest.raises(ValueError, match="scalar"):
+        index["scalar"].rows(0, 1)
+
+    # Neighbouring ranges are one read; a range and the tensor it comes from, too.
+    pieces = [table.rows(0, 4), table.rows(4, 10)]
+    (run,) = runs_of(reversed(pieces))
+    assert (run.offset, run.nbytes, run.entries) == (table.offset, 120, tuple(pieces))
+    (run,) = runs_of([table.rows(1, 3), table])
+    assert (run.offset, run.nbytes) == (table.offset, 120) and len(run.entries) == 2
+    assert [r.nbytes for r in runs_of([table.rows(0, 2), table.rows(5, 6)])] == [24, 12]
+    assert [r.nbytes for r in runs_of([table.rows(0, 2), table.rows(5, 6)], max_gap=36)] == [72]
 
 
 def test_shards_are_found_through_the_weight_map(tmp_path, safetensors_writer):

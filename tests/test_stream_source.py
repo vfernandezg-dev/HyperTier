@@ -82,9 +82,11 @@ def test_a_planned_block_puts_every_tensor_where_the_slot_expects_it(
     other = {"other.weight": ("U8", (700,), blob(99, 700))}
     block = {f"b.{i}": ("U8", (n,), blob(i, n)) for i, n in enumerate(sizes)}
     path = safetensors_writer(tmp_path / "m.safetensors", {**other, **block})
-    plan = plan_block(SafetensorsIndex(path), list(block))
+    index = SafetensorsIndex(path)
+    plan = plan_block({f"local.{name}": index[name] for name in reversed(block)})
 
-    assert [entry.name for entry, _ in plan.entries] == list(block)
+    assert [entry.name for entry, _ in plan.entries] == list(block), "file order"
+    assert plan.names == tuple(f"local.{name}" for name in block)
     assert all(offset % ALIGN == 0 for _, offset in plan.entries)
     assert len(plan.reads) == 1 and plan.host_bytes % PAGE == 0
     aligned = all(n % ALIGN == 0 for n in sizes)
@@ -99,12 +101,34 @@ def test_a_block_split_over_two_shards_is_two_reads(tmp_path, safetensors_writer
     second = {"b.2": ("U8", (768,), blob(3, 768))}
     safetensors_writer(tmp_path / "a.safetensors", first)
     safetensors_writer(tmp_path / "b.safetensors", second)
-    plan = plan_block(SafetensorsIndex(tmp_path), ["b.0", "b.1", "b.2"])
+    index = SafetensorsIndex(tmp_path)
+    plan = plan_block({name: index[name] for name in ("b.0", "b.1", "b.2")})
     assert len(plan.reads) == 2 and len(plan.spans) == 2
     assert plan.reads[1][1] == plan.reads[0][2], "the second range starts on the next page"
     slot = assemble(plan)
     assert bytes(slot) == b"".join(data for _, _, data in {**first, **second}.values())
-    assert plan_block(SafetensorsIndex(tmp_path), []).host_bytes == 0
+    assert plan_block({}).host_bytes == 0
+
+
+def test_a_block_can_be_a_range_of_rows_of_a_larger_tensor(tmp_path, safetensors_writer):
+    rows, width = 40, 96  # F16: a row is 192 bytes, so most row ranges are not 256-aligned
+    table = blob(5, rows * width * 2)
+    tensors = {
+        "a.bias": ("U8", (333,), blob(1, 333)),
+        "head.weight": ("F16", (rows, width), table),
+        "z.bias": ("U8", (50,), blob(2, 50)),
+    }
+    index = SafetensorsIndex(safetensors_writer(tmp_path / "m.safetensors", tensors))
+    for start, stop in [(0, 13), (13, 27), (27, 40), (0, 40), (7, 7)]:
+        piece = index["head.weight"].rows(start, stop)
+        plan = plan_block({"weight": piece})
+        assert plan.names == ("weight",) and plan.size >= piece.nbytes
+        assert len(plan.reads) == 1
+        assert bytes(assemble(plan)[: piece.nbytes]) == table[start * 192 : stop * 192]
+    # Two names for the same bytes cannot be laid out: which one would the slot hold?
+    piece = index["head.weight"].rows(0, 8)
+    with pytest.raises(ValueError, match="same bytes"):
+        plan_block({"weight": piece, "again": piece})
 
 
 # ---------------------------------------------------------------------------------------------
@@ -417,6 +441,45 @@ def test_weights_from_files_are_bit_exact_in_every_tier(
             for want in expected:
                 y = model(y)
                 assert torch.equal(y, want)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("tier", ["ram", "nvme"])
+def test_a_tensor_is_streamed_as_ranges_of_its_rows(disk_tmp, safetensors_writer, tier):
+    import torch
+    from torch import nn
+
+    body = toy_mlp(3, 64)
+    head = nn.Linear(64, 300)  # as large as two blocks and a half: it gets no slot of its own
+    tensors = checkpoint_tensors(body)
+    tensors.update({f"head.{name}": value for name, value in checkpoint_tensors(head).items()})
+    index = SafetensorsIndex(safetensors_writer(disk_tmp / "model.safetensors", tensors))
+    bounds = [(0, 100), (100, 228), (228, 300)]
+    x = torch.randn(5, 64, device="cuda")
+    with torch.no_grad():
+        hidden = copy.deepcopy(body).cuda()(x)
+        weight, bias = head.weight.cuda(), head.bias.cuda()
+        expected = [nn.functional.linear(hidden, weight[a:b], bias[a:b]) for a, b in bounds]
+
+    chunks = nn.ModuleList(nn.Linear(64, b - a) for a, b in bounds)
+    sources = [
+        {"weight": index["head.weight"].rows(a, b), "bias": index["head.bias"].rows(a, b)}
+        for a, b in bounds
+    ]
+    host = max(plan.host_bytes for plan in FileWeights(index, sources).plan(torch, chunks))
+    weights = FileWeights(
+        index, block_prefixes(body) + sources, ram_budget=None if tier == "ram" else 2 * host
+    )
+    with LayerStreamer([*body.blocks, *chunks], slots=2, weights=weights) as streamer:
+        assert set(streamer.tiers) == {tier} and streamer.num_blocks == 6
+        with torch.no_grad():
+            for _ in range(3):
+                hidden = body(x)
+                for chunk, want in zip(chunks, expected):
+                    assert torch.equal(chunk(hidden), want)
+    # A parameter the mapping does not name is an error, not a silent random weight.
+    with pytest.raises(ValueError, match="'bias' is not in the checkpoint"):
+        LayerStreamer(chunks, weights=FileWeights(index, [{"weight": s["weight"]} for s in sources]))
 
 
 @pytest.mark.cuda

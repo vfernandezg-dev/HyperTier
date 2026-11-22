@@ -38,14 +38,14 @@ import mmap
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from os import PathLike
 from typing import TYPE_CHECKING, Any, Protocol
 
 from hypertier.io.direct import DirectReader, aligned_span
-from hypertier.io.safetensors_index import Run, SafetensorsIndex, TensorEntry
+from hypertier.io.safetensors_index import Run, SafetensorsIndex, TensorEntry, runs_of
 from hypertier.stream.pinned import PinnedPool, align_up
 from hypertier.telemetry._common import MiB, format_bytes
 
@@ -431,6 +431,7 @@ def merge_spans(spans: Sequence[tuple[int, int, int, int]]) -> list[tuple[int, i
 class BlockPlan:
     """Where a block's bytes are on disk, in RAM and in a slot."""
 
+    names: tuple[str, ...]  # what the block calls each tensor of ``entries``
     entries: tuple[tuple[TensorEntry, int], ...]  # (tensor, slot offset), in file order
     size: int  # bytes of a slot the block uses
     reads: tuple[tuple[Run, int, int], ...]  # (run, where its aligned range goes, its length)
@@ -438,13 +439,20 @@ class BlockPlan:
     host_bytes: int  # page-locked bytes the block takes, in RAM or in a staging buffer
 
 
-def plan_block(index: SafetensorsIndex, names: Sequence[str]) -> BlockPlan:
-    """Lay ``names`` out in a slot in file order and work out the reads and copies.
+def plan_block(tensors: Mapping[str, TensorEntry]) -> BlockPlan:
+    """Lay a block's tensors out in a slot in file order and work out the reads and copies.
 
-    Each run is read through its block-aligned range; the ranges of a block sit one after
-    the other on page boundaries, in a RAM-tier region and in a staging buffer alike.
+    ``tensors`` maps the name the block has for each tensor (its parameter name) to the
+    entry that holds its bytes. Each run is read through its block-aligned range; the ranges
+    of a block sit one after the other on page boundaries, in a RAM-tier region and in a
+    staging buffer alike.
     """
-    runs = index.runs(names)
+    local = {}
+    for name, entry in tensors.items():
+        if local.setdefault(entry, name) != name:
+            raise ValueError(f"{name!r} and {local[entry]!r} are the same bytes: {entry.name!r}")
+    runs = runs_of(tensors.values())
+    names: list[str] = []
     entries: list[tuple[TensorEntry, int]] = []
     reads: list[tuple[Run, int, int]] = []
     pieces: list[tuple[int, int, int, int]] = []
@@ -454,13 +462,16 @@ def plan_block(index: SafetensorsIndex, names: Sequence[str]) -> BlockPlan:
         start, length = aligned_span(run.offset, run.nbytes)
         reads.append((run, host_offset, length))
         for entry in run.entries:
+            names.append(local[entry])
             entries.append((entry, slot_offset))
             source = host_offset + entry.offset - start
             pieces.append((number, source, slot_offset, entry.nbytes))
             slot_offset = align_up(slot_offset + entry.nbytes)
         host_offset += length
     spans = tuple((src, dst, n) for _, src, dst, n in merge_spans(pieces))
-    return BlockPlan(tuple(entries), slot_offset, tuple(reads), spans, host_offset)
+    return BlockPlan(
+        tuple(names), tuple(entries), slot_offset, tuple(reads), spans, host_offset
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -478,7 +489,10 @@ class FileWeights:
 
     Args:
         index: the checkpoint, or the path of its file or directory of shards.
-        prefixes: per block, the prefix of its tensor names, e.g. ``"model.layers.3."``.
+        prefixes: per block, the prefix of its tensor names, e.g. ``"model.layers.3."``. A
+            block whose weights are not whole named tensors gives instead a mapping from each
+            of its parameter names to the entry holding the bytes, e.g. a range of rows of a
+            larger tensor (:meth:`~hypertier.io.TensorEntry.rows`).
         ram_budget: page-locked RAM the weights may take, staging included. None: all the
             blocks stay in RAM (the RAM tier). With less than that, the blocks that do not
             fit are read from disk on every pass (the NVMe tier).
@@ -494,7 +508,7 @@ class FileWeights:
     def __init__(
         self,
         index: SafetensorsIndex | str | PathLike[str],
-        prefixes: Sequence[str],
+        prefixes: Sequence[str | Mapping[str, TensorEntry]],
         *,
         ram_budget: int | None = None,
         num_stage: int = 2,
@@ -517,11 +531,15 @@ class FileWeights:
         if len(self.prefixes) != len(blocks):
             raise ValueError(f"{len(self.prefixes)} prefixes for {len(blocks)} blocks")
         plans = []
-        for number, (block, prefix) in enumerate(zip(blocks, self.prefixes)):
-            names = []
+        for number, (block, source) in enumerate(zip(blocks, self.prefixes)):
+            tensors = {}
             for local, param in block.named_parameters():
-                name = prefix + local
-                entry = self.index.get(name)
+                if isinstance(source, str):
+                    name = source + local
+                    entry = self.index.get(name)
+                else:
+                    entry = source.get(local)
+                    name = local if entry is None else entry.name
                 if entry is None:
                     raise ValueError(f"block {number}: tensor {name!r} is not in the checkpoint")
                 dtype = torch_dtype(torch, entry.dtype)
@@ -530,8 +548,8 @@ class FileWeights:
                         f"block {number}: {name!r} is {entry.dtype} {list(entry.shape)} in the "
                         f"checkpoint, but the module expects {param.dtype} {list(param.shape)}"
                     )
-                names.append(name)
-            plans.append(plan_block(self.index, names))
+                tensors[local] = entry
+            plans.append(plan_block(tensors))
         return plans
 
 
