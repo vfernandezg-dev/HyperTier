@@ -30,8 +30,33 @@ PyTorch, so the policy is tested on machines without it.
 
 from __future__ import annotations
 
+import statistics
+import warnings
+from collections import deque
 from collections.abc import Collection, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import partial
+from typing import TYPE_CHECKING, Any
+
+from hypertier.stream.pinned import ALIGN, PinnedPool, align_up, pow2_ceil
+from hypertier.telemetry._common import (
+    MiB,
+    format_bytes,
+    import_torch,
+    require_cuda,
+    resolve_device,
+)
+from hypertier.telemetry.bandwidth import overlap_efficiency
+
+if TYPE_CHECKING:
+    import torch
+    from torch import nn
+    from typing_extensions import Self
+
+_OVERSIZE_RATIO = 1.5  # warn when the largest block exceeds this many times the median
+_MIN_PRIVATE_SEGMENT = 16 * MiB  # tiny models: do not pin one segment per tiny block
+_MAX_PENDING_PASSES = 64  # telemetry of passes the GPU has not finished yet
+_HISTORY_PASSES = 1024
 
 # ---------------------------------------------------------------------------------------------
 # Slot policy (no PyTorch)
@@ -165,3 +190,535 @@ class SlotTable:
             self._place(block, slot)
             loads.append(Load(block, slot, demand=False))
         return loads
+
+
+# ---------------------------------------------------------------------------------------------
+# Telemetry
+
+
+@dataclass(frozen=True)
+class PassStats:
+    """One pass over the blocks, timed with CUDA events on the device timeline.
+
+    The times are measured while copies and compute overlap. If a copy in flight slows the
+    kernels down (as on WSL2, issue #1), that slowdown is inside ``compute_ms`` and
+    ``efficiency`` does not show it: it reports how much of the shorter side the pipeline hid,
+    not what the hardware lost to contention. For the end-to-end figure, compare ``total_ms``
+    with the same pass on a model that is fully resident in VRAM.
+    """
+
+    blocks: int  # block forwards in the pass
+    copies: int  # host-to-device copies enqueued during the pass
+    misses: int  # of those, blocks loaded on demand instead of prefetched
+    bytes_copied: int
+    copy_ms: float  # sum of the copies (copy stream)
+    compute_ms: float  # sum of the block forwards (compute stream)
+    stall_ms: float  # time the compute stream waited for a slot to be ready
+    total_ms: float  # first block reached -> last block or last copy finished
+    efficiency: float | None  # overlap_efficiency(copy, compute, total); None without copies
+
+
+@dataclass
+class _PassRecord:
+    """Events of a pass that the GPU may still be executing."""
+
+    compute: list[list[Any]] = field(default_factory=list)  # [reached, started, finished]
+    copies: list[tuple[Any, Any]] = field(default_factory=list)  # (started, finished)
+    misses: int = 0
+    bytes_copied: int = 0
+
+
+class _TimingEvents:
+    """Recycles timing events: a pass needs five per block, every pass."""
+
+    def __init__(self, torch: Any) -> None:
+        self._torch = torch
+        self._idle: list[Any] = []
+
+    def record(self, stream: Any) -> Any:
+        event = self._idle.pop() if self._idle else self._torch.cuda.Event(enable_timing=True)
+        event.record(stream)
+        return event
+
+    def recycle(self, events: Iterable[Any]) -> None:
+        self._idle.extend(events)
+
+
+# ---------------------------------------------------------------------------------------------
+# Streamer
+
+
+def find_blocks(model: nn.Module) -> nn.ModuleList:
+    """The model's stack of blocks: its largest ``ModuleList`` by parameter bytes.
+
+    Raises ``ValueError`` when there is none, or when a second, unrelated list is at least
+    half as large (e.g. the double- and single-stream stacks of some diffusion transformers):
+    guessing wrong would leave gigabytes of weights off the GPU or out of the stream. Pass the
+    blocks explicitly then, concatenating the lists in the order they run.
+    """
+    torch = import_torch()
+    found = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.ModuleList) and len(module) >= 2:
+            nbytes = sum(p.numel() * p.element_size() for p in module.parameters())
+            if nbytes:
+                found.append((nbytes, name, module))
+    if not found:
+        raise ValueError("no ModuleList with parameters found; pass the blocks explicitly")
+    found.sort(key=lambda item: item[0], reverse=True)
+    nbytes, name, best = found[0]
+    inside = name + "." if name else ""
+    rivals = [c for c in found[1:] if not c[1].startswith(inside) and 2 * c[0] >= nbytes]
+    if rivals:
+        listing = ", ".join(
+            f"{n or '<root>'} ({len(m)} blocks, {format_bytes(b)})"
+            for b, n, m in [found[0], *rivals]
+        )
+        raise ValueError(
+            f"ambiguous block list: {listing}; pass the blocks explicitly, in the order they run"
+        )
+    return best
+
+
+class LayerStreamer:
+    """Stream the weights of ``blocks`` through a few VRAM slots while the model runs.
+
+    Construction moves the blocks' parameters into page-locked RAM (one block at a time, so
+    RAM peaks near the model size plus one block), reserves ``slots`` VRAM buffers of the size
+    of the largest block and installs forward hooks. The model itself is not rewritten: call
+    it as usual, under ``torch.no_grad()`` or ``torch.inference_mode()``, with its inputs and
+    its non-streamed modules on ``device``. Before a block runs, its parameters are repointed
+    (``param.data``) to views of the slot holding its weights; afterwards they point back to
+    RAM, so ``state_dict()`` is always correct. See the module docstring for the streams and
+    events that order copies against compute.
+
+    Bytes moved per pass: every block that is not already in a slot, i.e. all the streamed
+    weights once per pass when there are more blocks than slots, and nothing otherwise.
+
+    Args:
+        blocks: the modules to stream, in the order they run (see :func:`find_blocks`).
+        slots: VRAM buffers. The prefetch runs ``slots - 1`` blocks ahead; two is the classic
+            ping-pong. Capped at the number of blocks.
+        device: the CUDA device that computes.
+        pool: page-locked RAM to take the weights from. Default: a private pool that grows as
+            blocks move in. Pass one to pay the pinning cost once across several models.
+        telemetry: time every pass with CUDA events (see :meth:`pass_stats`).
+
+    While attached, streamed parameters have ``requires_grad=False`` (a slot is overwritten
+    right after its block ran, so gradients could not be computed), and the blocks' buffers
+    live on ``device``: they are small and a model may write to them.
+
+    Limits of this core:
+
+    * Inference only, and one host thread drives the model.
+    * Do not move or convert the streamed blocks while attached (``model.to(...)``,
+      ``.half()``): that replaces the tensors the slots are fed from, and ``.to("cuda")`` would
+      load every block into VRAM at once. Place the rest of the model on ``device`` instead.
+    * Not compatible with CUDA Graphs: a captured graph replays kernels with the slot
+      addresses of the capture and skips the Python hooks, so nothing repoints parameters or
+      enqueues the copies and event waits.
+    * Not compatible with ``torch.compile``: compiled code assumes that parameter storage does
+      not change between calls, and the hooks change it on every block.
+    * Blocks must be distinct modules that share no parameters with each other, and a block
+      must not return a view of its own weights (the slot is reused after it finishes).
+    * A largest block far above the median wastes VRAM in every slot; a warning says so.
+    """
+
+    def __init__(
+        self,
+        blocks: Iterable[nn.Module],
+        *,
+        slots: int = 2,
+        device: torch.device | str = "cuda",
+        pool: PinnedPool | None = None,
+        telemetry: bool = True,
+    ) -> None:
+        torch = require_cuda()
+        modules = list(blocks)
+        if not modules:
+            raise ValueError("blocks is empty")
+        if any(not isinstance(m, torch.nn.Module) for m in modules):
+            raise TypeError("blocks must be torch.nn.Module instances")
+        if len({id(m) for m in modules}) != len(modules):
+            raise ValueError("blocks must be distinct modules; one appears twice")
+        if slots < 1:
+            raise ValueError(f"slots must be >= 1, got {slots}")
+        dev = resolve_device(device)
+        if dev.type != "cuda":
+            raise ValueError(f"device must be a CUDA device, got {dev}")
+
+        self.num_blocks = len(modules)
+        self.num_slots = 0
+        self.slot_bytes = 0
+        """Size of one VRAM slot: the largest block, parameters aligned to 256 bytes."""
+        self.vram_bytes = 0
+        """VRAM held while attached: the slots plus the blocks' buffers."""
+        self.streamed_bytes = 0
+        """Bytes of weights kept in page-locked RAM and streamed on demand."""
+
+        self._torch = torch
+        self._device = dev
+        self._blocks = modules
+        self._telemetry = telemetry
+        self._closed = False
+        self._pool: PinnedPool | None = None
+        self._owns_pool = pool is None
+        self._leased = False
+        self._sizes: list[int] = []
+        self._params: list[list[Any]] = []
+        self._host_views: list[list[Any]] = []
+        self._regions: list[Any] = []
+        self._grad_flags: list[tuple[Any, bool]] = []
+        self._moved_buffers: list[tuple[Any, str, Any]] = []
+        self._slots: list[Any] = []
+        self._slot_views: list[list[list[Any]]] = []
+        self._slot_dst: list[list[Any]] = []
+        self._copy_stream: Any = None
+        self._ready: list[Any] = []
+        self._free: list[Any] = []
+        self._hooks: list[Any] = []
+        self._table: SlotTable | None = None
+        self._running: dict[int, list[Any]] = {}
+        self._events = _TimingEvents(torch)
+        self._pass: _PassRecord | None = None
+        self._last_block = -1
+        self._pending: deque[_PassRecord] = deque()
+        self._history: deque[PassStats] = deque(maxlen=_HISTORY_PASSES)
+        try:
+            # Outside inference mode, whatever the caller's mode: an inference tensor could
+            # not back a parameter that is later used in a normal forward.
+            with torch.inference_mode(False), torch.no_grad():
+                self._build(slots, pool)
+        except BaseException:
+            self._teardown()
+            raise
+
+    # -----------------------------------------------------------------------------------------
+    # Public
+
+    def pass_stats(self) -> list[PassStats]:
+        """Timings of the passes run so far, oldest first (the last 1024 are kept).
+
+        A pass ends when the model wraps around to an earlier block, or here if no block is
+        running. Waits for the GPU to finish the work already enqueued, since the events of a
+        pass can only be read once they have happened. Empty with ``telemetry=False``.
+        """
+        if self._pass is not None and not self._running:
+            self._pending.append(self._pass)
+            self._pass = None
+            self._last_block = -1
+        self._harvest(wait=True)
+        return list(self._history)
+
+    def close(self) -> None:
+        """Detach from the model and free the VRAM slots (idempotent).
+
+        Waits for the copy stream and for the kernels still reading the slots before anything
+        is released. Afterwards the parameters are ordinary CPU tensors with their original
+        ``requires_grad``, and buffers are back on the device they came from. With a private
+        pool the parameters keep living in its page-locked memory, without a copy; with a
+        caller's pool they are copied to pageable memory, so the pool can be reset for the
+        next model.
+        """
+        if self._closed:
+            return
+        if self._running:
+            raise RuntimeError("close() called while a streamed block is running")
+        self._teardown()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    # -----------------------------------------------------------------------------------------
+    # Construction and teardown
+
+    def _build(self, slots: int, pool: PinnedPool | None) -> None:
+        torch = self._torch
+        dev = self._device
+        layouts, sizes = _plan_layout(torch, self._blocks)
+        largest = max(sizes)
+        median = statistics.median(sizes)
+        if median > 0 and largest > _OVERSIZE_RATIO * median:
+            warnings.warn(
+                f"the largest streamed block ({format_bytes(largest)}) is "
+                f"{largest / median:.1f}x the median ({format_bytes(median)}); every VRAM slot "
+                f"is sized for it, so each one wastes about {format_bytes(largest - median)} "
+                "most of the time. Split that block or keep it out of the streamed list.",
+                stacklevel=3,
+            )
+        table = SlotTable(len(sizes), slots)
+        self._table = table
+        self._sizes = sizes
+        self.num_slots = table.num_slots
+        self.slot_bytes = largest
+        self.streamed_bytes = sum(sizes)
+
+        if pool is None:
+            pool = PinnedPool(0, segment_bytes=max(pow2_ceil(largest), _MIN_PRIVATE_SEGMENT))
+        pool._attach()
+        self._pool = pool
+        self._leased = True
+
+        # One block at a time: assigning ``param.data`` drops the last reference to the
+        # original storage, so RAM never holds much more than the model plus one block.
+        for entries, size in zip(layouts, sizes):
+            region = pool.alloc(size)
+            params: list[Any] = []
+            views: list[Any] = []
+            self._regions.append(region)
+            self._params.append(params)
+            self._host_views.append(views)
+            for param, offset, nbytes in entries:
+                view = _typed_view(region, offset, nbytes, param)
+                view.copy_(param.data)
+                self._grad_flags.append((param, param.requires_grad))
+                param.requires_grad_(False)
+                param.data = view
+                params.append(param)
+                views.append(view)
+
+        resident = self._move_buffers()
+
+        self._slots = [
+            torch.empty(largest, dtype=torch.uint8, device=dev) for _ in range(table.num_slots)
+        ]
+        if largest and any(slot.data_ptr() % ALIGN for slot in self._slots):
+            raise RuntimeError(f"VRAM slot is not {ALIGN}-byte aligned")
+        # Every (slot, block) view is made here, once: the hooks only assign them.
+        self._slot_views = [
+            [[_typed_view(slot, off, n, p) for p, off, n in entries] for entries in layouts]
+            for slot in self._slots
+        ]
+        self._slot_dst = [[slot[:size] for size in sizes] for slot in self._slots]
+        self.vram_bytes = table.num_slots * largest + resident
+
+        self._copy_stream = torch.cuda.Stream(device=dev)
+        # Without timing: these only order the two streams, which is cheaper to wait on.
+        self._ready = [torch.cuda.Event(enable_timing=False) for _ in self._slots]
+        self._free = [torch.cuda.Event(enable_timing=False) for _ in self._slots]
+
+        for index, block in enumerate(self._blocks):
+            self._hooks.append(
+                block.register_forward_pre_hook(partial(self._enter, index), prepend=True)
+            )
+            # always_call: the slot must be released even when the block raises.
+            self._hooks.append(
+                block.register_forward_hook(partial(self._exit, index), always_call=True)
+            )
+        for load in table.prime():
+            self._copy(load)
+
+    def _move_buffers(self) -> int:
+        """Make the blocks' buffers resident on the device; return their size in bytes."""
+        dev = self._device
+        moved: dict[int, tuple[Any, Any]] = {}  # id -> (original kept alive, device copy)
+        resident: dict[int, int] = {}
+        for block in self._blocks:
+            for module in block.modules():
+                for key, buf in module._buffers.items():
+                    if buf is None:
+                        continue
+                    if buf.device != dev:
+                        if id(buf) not in moved:
+                            moved[id(buf)] = (buf, buf.to(dev))
+                        self._moved_buffers.append((module, key, buf.device))
+                        buf = moved[id(buf)][1]
+                        module._buffers[key] = buf
+                    resident[id(buf)] = buf.numel() * buf.element_size()
+        return sum(resident.values())
+
+    def _teardown(self) -> None:
+        """Undo whatever ``_build`` did; also the path taken when construction fails."""
+        torch = self._torch
+        self._closed = True
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+        if self._copy_stream is not None:
+            # A queued copy still reads the pool and writes a slot, and queued kernels still
+            # read the slots: nothing below may be released before both streams are idle.
+            self._copy_stream.synchronize()
+            torch.cuda.synchronize(self._device)
+            if self._pass is not None:
+                self._pending.append(self._pass)
+                self._pass = None
+            self._harvest(wait=True)
+        if not self._owns_pool:
+            # The caller may reset the pool for another model: take the weights out of it.
+            with torch.inference_mode(False), torch.no_grad():
+                for params, views in zip(self._params, self._host_views):
+                    for param, view in zip(params, views):
+                        param.data = view.clone()
+        for param, flag in self._grad_flags:
+            param.requires_grad_(flag)
+        for module, key, device in self._moved_buffers:
+            buf = module._buffers.get(key)
+            if buf is not None:
+                module._buffers[key] = buf.to(device)
+        for state in (
+            self._grad_flags, self._moved_buffers, self._params, self._host_views,
+            self._regions, self._slots, self._slot_views, self._slot_dst, self._ready,
+            self._free,
+        ):
+            state.clear()
+        self._copy_stream = None
+        if self._leased and self._pool is not None:
+            self._pool._detach()
+            self._leased = False
+        self._pool = None
+
+    # -----------------------------------------------------------------------------------------
+    # Hot path: these run around every block and only enqueue work
+
+    def _enter(self, index: int, module: Any, args: Any) -> None:
+        run = self._running.get(index)
+        if run is not None:  # the block calls itself: its weights are already in place
+            run[0] += 1
+            return
+        slot, loads = self._table.enter(index)
+        compute = self._torch.cuda.current_stream(self._device)
+        record = None
+        if self._telemetry:
+            if self._pass is None or index <= self._last_block:
+                self._roll_pass()
+            self._last_block = index
+            record = self._pass
+        for load in loads:
+            self._copy(load)
+        timing = None
+        if record is not None:
+            reached = self._events.record(compute)
+            compute.wait_event(self._ready[slot])  # compute waits for the copy
+            timing = [reached, self._events.record(compute), None]
+            record.compute.append(timing)
+        else:
+            compute.wait_event(self._ready[slot])
+        for param, view in zip(self._params[index], self._slot_views[slot][index]):
+            param.data = view
+        self._running[index] = [1, slot, timing]
+
+    def _exit(self, index: int, module: Any, args: Any, output: Any) -> None:
+        run = self._running.get(index)
+        if run is None:  # the pre-hook raised before the block got a slot
+            return
+        run[0] -= 1
+        if run[0]:
+            return
+        del self._running[index]
+        _, slot, timing = run
+        compute = self._torch.cuda.current_stream(self._device)
+        if timing is not None:
+            timing[2] = self._events.record(compute)
+        # Every kernel of the block is enqueued by now: the slot is free once they finish.
+        self._free[slot].record(compute)
+        for param, view in zip(self._params[index], self._host_views[index]):
+            param.data = view
+        self._table.exit(index)
+
+    def _copy(self, load: Load) -> None:
+        """Enqueue the copy of a block into its slot, behind the slot's last reader."""
+        stream = self._copy_stream
+        nbytes = self._sizes[load.block]
+        stream.wait_event(self._free[load.slot])  # the copy waits for compute
+        record = self._pass if nbytes else None
+        started = self._events.record(stream) if record is not None else None
+        if nbytes:
+            with self._torch.cuda.stream(stream):
+                self._slot_dst[load.slot][load.block].copy_(
+                    self._regions[load.block], non_blocking=True
+                )
+        self._ready[load.slot].record(stream)
+        if record is not None:
+            record.copies.append((started, self._events.record(stream)))
+            record.bytes_copied += nbytes
+            record.misses += load.demand
+
+    # -----------------------------------------------------------------------------------------
+    # Telemetry
+
+    def _roll_pass(self) -> None:
+        if self._pass is not None:
+            self._pending.append(self._pass)
+        self._pass = _PassRecord()
+        self._harvest(wait=False)
+
+    def _harvest(self, *, wait: bool) -> None:
+        """Turn finished passes into stats; without ``wait`` only those the GPU completed."""
+        pending = self._pending
+        while pending:
+            # The host can enqueue many passes ahead of the GPU; past the cap, wait for the
+            # oldest instead of holding its events forever.
+            if not self._finish(pending[0], wait or len(pending) > _MAX_PENDING_PASSES):
+                break
+            pending.popleft()
+
+    def _finish(self, record: _PassRecord, wait: bool) -> bool:
+        compute = [t for t in record.compute if t[2] is not None]
+        tails = [t[2] for t in compute[-1:]] + [c[1] for c in record.copies[-1:]]
+        if wait:
+            for event in tails:
+                event.synchronize()
+        elif not all(event.query() for event in tails):
+            return False
+        if compute:
+            start = compute[0][0]
+            copy_ms = sum(a.elapsed_time(b) for a, b in record.copies)
+            compute_ms = sum(started.elapsed_time(done) for _, started, done in compute)
+            total_ms = max(start.elapsed_time(event) for event in tails)
+            efficiency = None
+            if copy_ms > 0 and compute_ms > 0:
+                efficiency = overlap_efficiency(copy_ms, compute_ms, total_ms)
+            self._history.append(
+                PassStats(
+                    blocks=len(compute),
+                    copies=len(record.copies),
+                    misses=record.misses,
+                    bytes_copied=record.bytes_copied,
+                    copy_ms=copy_ms,
+                    compute_ms=compute_ms,
+                    stall_ms=sum(reached.elapsed_time(started) for reached, started, _ in compute),
+                    total_ms=total_ms,
+                    efficiency=efficiency,
+                )
+            )
+        self._events.recycle(e for t in record.compute for e in t if e is not None)
+        self._events.recycle(e for pair in record.copies for e in pair)
+        return True
+
+
+def _plan_layout(
+    torch: Any, modules: list[Any]
+) -> tuple[list[list[tuple[Any, int, int]]], list[int]]:
+    """Per block, ``(parameter, byte offset, byte size)`` and the block's total size.
+
+    The same layout is used in RAM and in every slot, so a block is a single contiguous copy.
+    """
+    owner: dict[int, int] = {}
+    layouts: list[list[tuple[Any, int, int]]] = []
+    sizes: list[int] = []
+    for index, block in enumerate(modules):
+        entries: list[tuple[Any, int, int]] = []
+        offset = 0
+        for name, param in block.named_parameters():
+            if id(param) in owner:
+                raise ValueError(
+                    f"parameter {name!r} of block {index} also belongs to block "
+                    f"{owner[id(param)]}; streamed blocks cannot share parameters"
+                )
+            owner[id(param)] = index
+            if param.layout is not torch.strided:
+                raise TypeError(f"parameter {name!r} of block {index} is not a dense tensor")
+            nbytes = param.numel() * param.element_size()
+            entries.append((param, offset, nbytes))
+            offset = align_up(offset + nbytes)
+        layouts.append(entries)
+        sizes.append(offset)
+    return layouts, sizes
+
+
+def _typed_view(buffer: Any, offset: int, nbytes: int, like: Any) -> Any:
+    """``nbytes`` of a uint8 buffer seen as a tensor with ``like``'s dtype and shape."""
+    return buffer[offset : offset + nbytes].view(like.dtype).view(like.shape)
