@@ -132,6 +132,13 @@ Create modules only when the current phase needs them.
    (`TensorEntry.rows`), and `model.device` answers with the GPU through a per-instance
    subclass, because `generate()` moves its inputs there. With two slots the pieces of
    `lm_head` after the first have no compute to hide behind.
+   `load_text_encoder` is the same for an encoder-only model (T5, umT5), the text stage of a
+   diffusion pipeline. T5 looks tokens up through a second module that holds the embedding's
+   parameter, so every module that holds it gets the same table. Its blocks are read from
+   disk on every call by default, with only the staging buffers pinned: the stage runs once
+   per prompt (umT5-XXL of Wan 2.2: 1.7 s to load and 3.4 s per call from disk, 9.8 s and
+   1.4-1.8 s with 8.63 GiB pinned). A batch of two prompts does not round like two batches
+   of one: to equal `diffusers` bit for bit, encode each prompt in its own pass.
 5. **Weights stream as 4-bit / fp8 / lossless (DFloat11-style)**, never "2.5-bit lossless".
    Do not compress activations in the compute path; bound their peak by splitting the work.
    Splitting is not all exact. Chunking a module over tokens or over the batch computes the
@@ -151,7 +158,9 @@ Create modules only when the current phase needs them.
    The crossover is at ≈ 13 tokens per pass, an estimate interpolated between those two CPU
    measurements. Below it, compute on the CPU the blocks that are in RAM; above it, stream
    them to the GPU. The F4 planner will choose the compute device per block and per phase
-   (prefill, decoding). First case: `lm_head` on the CPU while decoding.
+   (prefill, decoding). First case: `lm_head` on the CPU while decoding. Far above the
+   crossover the GPU wins by a wide margin: two prompts of 512 tokens through the umT5-XXL
+   of Wan 2.2 take 125 s on the CPU in bf16 and 3.4 s streamed from disk.
 
 ## Coding conventions
 
