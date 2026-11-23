@@ -18,13 +18,14 @@ import pytest
 
 from hypertier.adapters.hf_diffusers import (
     VAE_CONFIGS,
-    VAE_MARGIN,
     VaeConfig,
     choose_vae_config,
     denoise,
     load_wan_transformer,
     load_wan_vae,
+    usable_vae_configs,
 )
+from hypertier.diffusion.sequential import VRAM_MARGIN
 from hypertier.diffusion.tiling import Canvas
 
 MiB = 1 << 20
@@ -91,30 +92,76 @@ def to_frames(video):
 
 
 def config(dtype, streamed, max_tile_cells):
-    return VaeConfig("test", dtype, streamed, max_tile_cells, 0, 0.0)
+    return VaeConfig("test", dtype, streamed, max_tile_cells, ((1, 0),), 0.0)
 
 
 # ---------------------------------------------------------------------------------------------
 # Choosing a configuration (no GPU)
 
 
-def test_the_configurations_are_ordered_best_first_and_chosen_by_budget():
-    streamed, resident, wide = VAE_CONFIGS
-    assert [c.name for c in VAE_CONFIGS] == ["bf16-streamed", "bf16-resident", "fp32-streamed"]
-    assert streamed.max_tile_cells > resident.max_tile_cells > wide.max_tile_cells
-    assert streamed.peak_bytes > resident.peak_bytes > wide.peak_bytes
-    assert VAE_MARGIN == 300 * MiB
-    for chosen in VAE_CONFIGS:
-        assert choose_vae_config(chosen.peak_bytes + VAE_MARGIN) is chosen
-        assert choose_vae_config(chosen.peak_bytes, margin=0) is chosen
-    assert choose_vae_config(streamed.peak_bytes + VAE_MARGIN - 1) is resident
-    assert choose_vae_config(resident.peak_bytes + VAE_MARGIN - 1) is wide
-    assert choose_vae_config(1 << 40) is streamed
+AMPERE, TURING = (8, 6), (7, 5)  # compute capabilities: RTX 30 series, GTX 16 series
+
+
+def test_the_configurations_are_ordered_best_first_and_chosen_by_budget_and_length():
+    streamed, resident, small, wide = VAE_CONFIGS
+    assert [c.name for c in VAE_CONFIGS] == [
+        "bf16-streamed", "bf16-resident", "bf16-streamed-small", "fp32-streamed"
+    ]  # fmt: skip
+    assert streamed.max_tile_cells > resident.max_tile_cells > small.max_tile_cells
+    assert small.max_tile_cells == wide.max_tile_cells and VRAM_MARGIN == 300 * MiB
+    for frames in (17, 33, 49, 121):
+        peaks = [config.peak_bytes(frames) for config in VAE_CONFIGS]
+        assert peaks[0] > peaks[1] > peaks[3] > peaks[2], "small tiles in bf16 need the least"
+
+        def choose(budget, frames=frames, **options):
+            return choose_vae_config(budget, frames, capability=AMPERE, **options)
+
+        assert choose(1 << 40) is streamed
+        assert choose(peaks[0] + VRAM_MARGIN) is streamed
+        assert choose(peaks[0] + VRAM_MARGIN - 1) is resident
+        assert choose(peaks[1] + VRAM_MARGIN - 1) is small, "before float32: faster, and less"
+        assert choose(peaks[2], margin=0) is small
+        with pytest.raises(ValueError, match=f"bf16-streamed-small, peaks at .* for {frames} fr"):
+            choose(peaks[2] + VRAM_MARGIN - 1)
+    for known in VAE_CONFIGS:
+        assert known.measured_frames == (17, 121), "what was measured"
+        by_length = [known.peak_bytes(frames) for frames in (17, 33, 49, 85, 121)]
+        assert by_length == sorted(by_length), "never less for a longer video"
+        assert by_length[::2] == [nbytes for _, nbytes in known.peaks]
+    # Between two measured lengths: on the line between them.
+    (_, low), (_, mid), (_, high) = resident.peaks
+    assert resident.peak_bytes(33) == (low + mid) // 2
+    assert resident.peak_bytes(85) == (mid + high) // 2
     # The reference laptop under the F3 criterion: 3.4 GB of VRAM for the whole process.
-    assert choose_vae_config(3_400_000_000) is resident
-    with pytest.raises(ValueError, match="the smallest, fp32-streamed, peaks at"):
-        choose_vae_config(wide.peak_bytes + VAE_MARGIN - 1)
-    assert choose_vae_config(100, configs=(config("float32", True, 9),), margin=10).name == "test"
+    assert choose_vae_config(3_400_000_000, 49, capability=AMPERE) is resident
+    assert choose_vae_config(3_400_000_000, 121, capability=AMPERE) is resident
+    only = (config("float32", True, 9),)
+    assert choose_vae_config(100, 1, configs=only, margin=10, capability=AMPERE).name == "test"
+
+
+def test_a_length_that_was_not_measured_is_refused_not_extrapolated():
+    for frames in (1, 13, 16, 122, 125, 241):
+        for known in VAE_CONFIGS:
+            with pytest.raises(ValueError, match=f"17 to 121 frames: nothing is known about {frames}"):
+                known.peak_bytes(frames)
+        with pytest.raises(ValueError, match="measured for videos of 17 to 121 frames"):
+            choose_vae_config(1 << 40, frames, capability=AMPERE)
+        with pytest.raises(ValueError, match="fp32-streamed was measured for videos of 17 to"):
+            choose_vae_config(1 << 40, frames, capability=TURING)
+
+
+def test_a_gpu_without_native_bfloat16_gets_the_float32_configuration():
+    wide = VAE_CONFIGS[-1]
+    assert wide.dtype == "float32"
+    assert usable_vae_configs(VAE_CONFIGS, TURING) == (wide,)
+    assert usable_vae_configs(VAE_CONFIGS, (6, 1)) == (wide,)
+    assert usable_vae_configs(VAE_CONFIGS, (8, 0)) == VAE_CONFIGS
+    assert usable_vae_configs(VAE_CONFIGS, (12, 0)) == VAE_CONFIGS
+    assert choose_vae_config(1 << 40, 49, capability=TURING) is wide
+    with pytest.raises(ValueError, match=r"compute capability 7\.5: the bfloat16 config"):
+        choose_vae_config(wide.peak_bytes(49) + VRAM_MARGIN - 1, 49, capability=TURING)
+    with pytest.raises(ValueError, match="no VAE configuration can run on this GPU"):
+        choose_vae_config(1 << 40, 49, capability=TURING, configs=VAE_CONFIGS[:3])
 
 
 # ---------------------------------------------------------------------------------------------
@@ -384,4 +431,5 @@ def test_the_real_vae_reaches_the_psnr_of_its_configuration(
     assert frames.shape == real_reference.shape == (4 * COMPARED - 3, 480, 832, 3)
     assert float(real_reference.float().std()) > 20, "the clip is a picture, not a flat frame"
     assert quality >= chosen.min_psnr_db
-    assert reserved <= chosen.peak_bytes, "under the peak the table promises to the planner"
+    promised = chosen.peaks[0][1]  # of the shortest video measured: this clip is shorter
+    assert reserved <= promised, "under the peak the table promises to the planner"

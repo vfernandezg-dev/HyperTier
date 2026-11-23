@@ -50,6 +50,7 @@ from hypertier.diffusion.chunking import (
     one_sample_at_a_time,
     runs_one_sample_at_a_time,
 )
+from hypertier.diffusion.sequential import CUDA_CONTEXT, VRAM_MARGIN
 from hypertier.diffusion.tiling import Canvas, TilePlan, plan_tiles
 from hypertier.io.safetensors_index import SafetensorsIndex
 from hypertier.stream.pingpong import LayerStreamer
@@ -77,47 +78,119 @@ class VaeConfig:
         streamed: whether the decoder's weights go through VRAM slots, which leaves room for
             larger tiles, or are resident.
         max_tile_cells: the largest area of a tile, in latent cells.
-        peak_bytes: VRAM the process holds at the peak of a decode, as the driver counts it
-            (the CUDA context included).
+        peaks: the VRAM a decode needs, by the length of the video: ``(frames, bytes)`` pairs
+            as measured, shortest first.
         min_psnr_db: the PSNR against the untiled float32 decode that a decode has to reach:
             the lowest measured, less 1 dB.
+
+    **What a peak is, and what it is compared with.** A peak is the most memory PyTorch's
+    allocator *reserved* during a decode run in a process of its own
+    (``torch.cuda.max_memory_reserved``), plus
+    :data:`~hypertier.diffusion.sequential.CUDA_CONTEXT` for what a process holds outside the
+    allocator. It is compared with a budget made the same way: the VRAM the driver reports
+    free after ``torch.cuda.empty_cache()``, plus what the process holds at that moment (see
+    :meth:`~hypertier.diffusion.sequential.SequentialPipeline.available`).
+
+    The 3.4 GB of the F3 criterion is another figure, measured another way: the most VRAM the
+    whole process holds *as the driver counts it*, sampled from the driver while a generation
+    runs, less what was in use before the process started. ``bench_video`` measures it. The
+    two agree within the difference between a real CUDA context (111 to 143 MiB measured) and
+    the 143 MiB assumed here.
     """
 
     name: str
     dtype: str
     streamed: bool
     max_tile_cells: int
-    peak_bytes: int
+    peaks: tuple[tuple[int, int], ...]
     min_psnr_db: float
+
+    @property
+    def measured_frames(self) -> tuple[int, int]:
+        """The shortest and the longest video the peak was measured with, in frames."""
+        return self.peaks[0][0], self.peaks[-1][0]
+
+    def peak_bytes(self, num_frames: int) -> int:
+        """The peak of decoding a video of ``num_frames`` frames, from the measurements.
+
+        ``vae.decode`` returns a tile with all of its frames in VRAM, so the peak grows with
+        the length, a little, and then levels off. Between two measured lengths it is
+        interpolated. Outside the measured range nothing is known, and nothing is made up:
+        it is an error.
+        """
+        shortest, longest = self.measured_frames
+        if not shortest <= num_frames <= longest:
+            raise ValueError(
+                f"the VRAM peak of {self.name} was measured for videos of {shortest} to "
+                f"{longest} frames: nothing is known about {num_frames}"
+            )
+        frames, nbytes = self.peaks[0]
+        for longer, more in self.peaks[1:]:
+            if num_frames <= longer:
+                return nbytes + round((more - nbytes) * (num_frames - frames) / (longer - frames))
+            frames, nbytes = longer, more
+        return nbytes
+
+
+def _peaks(at_17: int, at_49: int, at_121: int) -> tuple[tuple[int, int], ...]:
+    """Peaks of PyTorch's allocator in MiB at three lengths, as what the process holds."""
+    return tuple(
+        (frames, reserved * MiB + CUDA_CONTEXT)
+        for frames, reserved in ((17, at_17), (49, at_49), (121, at_121))
+    )
 
 
 VAE_CONFIGS: tuple[VaeConfig, ...] = (
-    VaeConfig("bf16-streamed", "bfloat16", True, 600, 3085 * MiB, 41.4),
-    VaeConfig("bf16-resident", "bfloat16", False, 340, 2815 * MiB, 38.4),
-    VaeConfig("fp32-streamed", "float32", True, 256, 2445 * MiB, 37.2),
+    VaeConfig("bf16-streamed", "bfloat16", True, 600, _peaks(2954, 2954, 2954), 41.4),
+    VaeConfig("bf16-resident", "bfloat16", False, 340, _peaks(2606, 2674, 2704), 38.4),
+    VaeConfig("bf16-streamed-small", "bfloat16", True, 256, _peaks(1250, 1368, 1368), 36.8),
+    VaeConfig("fp32-streamed", "float32", True, 256, _peaks(2316, 2316, 2336), 37.2),
 )
 """The configurations of the Wan 2.2 VAE (16 px per latent cell), best first.
 
-Measured on the reference laptop at the two sizes of the F3 criterion, each run in a process
-of its own with the GPU warmed up (63 to 77 °C). Time and peak are of one whole video; PSNR is
-against the untiled float32 decode, over the first 9 frames of five videos per size::
+Measured on the reference laptop, each decode in a process of its own with the GPU warmed up
+(64 to 77 °C). Time is of one whole video. The peak is what PyTorch's allocator reserved, at
+the larger of 480p and 720p, with 17, 49 and 121 frames. PSNR is against the untiled float32
+decode, over the first 9 frames of five videos at 720p x 49 and five at 480p x 121::
 
-                   720p x 49 frames              480p x 121 frames
-                   tiles      time    peak       tiles      time    peak       PSNR, dB
-    bf16-streamed   8 (24x23) 106 s   2871 MiB    3 (30x20) 106 s   3085 MiB   42.4 - 54.4
-    bf16-resident  16 (14x23) 128 s   2763 MiB    6 (17x20) 124 s   2815 MiB   39.4 - 53.6
-    fp32-streamed  24 (14x17) 293 s   2445 MiB   10 (17x14) 297 s   2445 MiB   38.2 - 55.2
+                         720p x 49          480p x 121         720p x 121   peak, MiB
+                         tiles      time    tiles      time    time         17 / 49 / 121 fr   PSNR, dB
+    bf16-streamed         8 (24x23) 101 s    3 (30x20) 101 s   250 s        2954 / 2954 / 2954  42.4 - 54.4
+    bf16-resident        16 (14x23) 122 s    6 (17x20) 119 s   302 s        2606 / 2674 / 2704  39.4 - 53.6
+    bf16-streamed-small  24 (14x17) 153 s   10 (17x14) 156 s   375 s        1250 / 1368 / 1368  37.8 - 53.2
+    fp32-streamed        24 (14x17) 280 s   10 (17x14) 286 s   689 s        2316 / 2316 / 2336  38.2 - 55.2
+
+The length of the video moves the peak by 4 % at most, and not in proportion: a tile's
+activations decide it, and they do not depend on the length.
 
 The PSNR follows the picture far more than the configuration: 15 dB between a blurred
 background and a street of neon signs. Then the tile: with the same tiles float32 is 0.3 to
-0.8 dB above bfloat16, while tiles of 340 cells instead of 256 are 1.2 to 2.7 dB above. That
-is why float32 comes last: its weights leave room for small tiles only, and every block is
-copied to VRAM for every latent frame of every tile (104 s of its 293 s are copies).
+0.8 dB above bfloat16, while tiles of 340 cells instead of 256 are 1.2 to 2.7 dB above. So
+float32 comes last: with the same small tiles as ``bf16-streamed-small`` it gains 0.4 dB,
+takes twice the time and 950 MiB more, since every block of its decoder is copied to VRAM
+for every latent frame of every tile. It is what there is for a GPU without native bfloat16.
 """
 
-VAE_MARGIN = 300 * MiB
-"""VRAM left free above the measured peak when a configuration is chosen: the peaks are
-measurements on one machine, and the desktop may take some at any time."""
+BF16_CAPABILITY = (8, 0)
+"""The CUDA compute capability from which bfloat16 is native (Ampere). Below it, as on the
+GTX 16 series, the configurations that run in bfloat16 are not offered."""
+
+
+def vae_config_named(name: str) -> VaeConfig:
+    """The configuration of :data:`VAE_CONFIGS` called ``name``."""
+    named = {known.name: known for known in VAE_CONFIGS}
+    if name not in named:
+        raise ValueError(f"no VAE configuration is called {name!r}: {sorted(named)}")
+    return named[name]
+
+
+def usable_vae_configs(
+    configs: tuple[VaeConfig, ...], capability: tuple[int, int] | None
+) -> tuple[VaeConfig, ...]:
+    """The configurations a GPU of this compute capability can run, in the same order."""
+    if capability is None or tuple(capability) >= BF16_CAPABILITY:
+        return tuple(configs)
+    return tuple(config for config in configs if config.dtype != "bfloat16")
 
 
 def load_wan_transformer(
@@ -239,25 +312,47 @@ def load_wan_transformer(
 
 def choose_vae_config(
     vram_budget: int,
+    num_frames: int,
     *,
-    margin: int = VAE_MARGIN,
+    margin: int = VRAM_MARGIN,
+    capability: tuple[int, int] | None = None,
     configs: tuple[VaeConfig, ...] = VAE_CONFIGS,
 ) -> VaeConfig:
-    """The best configuration whose measured peak leaves ``margin`` of ``vram_budget``.
+    """The best configuration this GPU can run whose peak leaves ``margin`` of the budget.
 
     Args:
-        vram_budget: VRAM the process may hold, in bytes, as the driver counts it.
+        vram_budget: VRAM the process may hold, in bytes: what
+            :meth:`~hypertier.diffusion.sequential.SequentialPipeline.available` returns.
+        num_frames: frames of the video: the peak depends on them.
         margin: bytes to leave free above the measured peak.
+        capability: CUDA compute capability of the GPU, as ``(major, minor)``. None asks the
+            current device. Below 8.0 the bfloat16 configurations are left out.
         configs: what to choose from, best first.
+
+    Peaks and budget are both in the allocator's terms, see :class:`VaeConfig`. A length
+    outside the range the peaks were measured for (17 to 121 frames) is refused: nothing is
+    extrapolated.
     """
-    for config in configs:
-        if config.peak_bytes + margin <= vram_budget:
+    if capability is None:
+        capability = tuple(require_cuda().cuda.get_device_capability())
+    usable = usable_vae_configs(configs, capability)
+    for config in usable:  # the same range for all of them: the first one says it
+        config.peak_bytes(num_frames)
+    for config in usable:
+        if config.peak_bytes(num_frames) + margin <= vram_budget:
             return config
-    least = min(configs, key=lambda config: config.peak_bytes)
+    why = ""
+    if len(usable) < len(configs):
+        shown = ".".join(map(str, capability))
+        why = f" (compute capability {shown}: the bfloat16 configurations are left out)"
+    if not usable:
+        raise ValueError(f"no VAE configuration can run on this GPU{why}")
+    least = min(usable, key=lambda config: config.peak_bytes(num_frames))
     raise ValueError(
         f"no VAE configuration fits {format_bytes(vram_budget)} of VRAM with "
-        f"{format_bytes(margin)} to spare: the smallest, {least.name}, peaks at "
-        f"{format_bytes(least.peak_bytes)}. Free VRAM, or pass a smaller margin"
+        f"{format_bytes(margin)} to spare{why}: the smallest, {least.name}, peaks at "
+        f"{format_bytes(least.peak_bytes(num_frames))} for {num_frames} frames. Free VRAM, "
+        "decode fewer frames, or pass a smaller margin"
     )
 
 
@@ -410,10 +505,7 @@ def load_wan_vae(
     diffusers = _import_diffusers()
     dev = resolve_device(device)
     if isinstance(config, str):
-        named = {known.name: known for known in VAE_CONFIGS}
-        if config not in named:
-            raise ValueError(f"no VAE configuration is called {config!r}: {sorted(named)}")
-        config = named[config]
+        config = vae_config_named(config)
     root = Path(model_dir)
     index = SafetensorsIndex(root)
     cls = getattr(diffusers, _VAE_CLASS)
@@ -656,13 +748,15 @@ class _OneRow:
 
 
 __all__ = [
+    "BF16_CAPABILITY",
     "MIN_DIFFUSERS",
     "VAE_CONFIGS",
-    "VAE_MARGIN",
     "VaeConfig",
     "WanVae",
     "choose_vae_config",
     "denoise",
     "load_wan_transformer",
     "load_wan_vae",
+    "usable_vae_configs",
+    "vae_config_named",
 ]
