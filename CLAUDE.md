@@ -32,10 +32,11 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
   - F2 (KV-cache compression) last: where the KV cache lives depends on where attention is
     computed, and that is what F4 decides.
 - **F3 is in progress.** Landed: dtype conversion while loading (`FileWeights(cast=True)`),
-  the Wan transformer with its sampling loop (`adapters/hf_diffusers.py`,
-  `diffusion/chunking.py`), the VAE decoded in tiles (`diffusion/tiling.py`, `load_wan_vae`)
-  and the pipeline that runs the stages one at a time (`diffusion/sequential.py`,
-  `adapters/wan_pipeline.py`: `load_wan_pipeline`). Exit criterion: 720p x 49 frames, and
+  the Wan transformer with its sampling loops (`adapters/hf_diffusers.py`: `denoise`, and
+  `denoise_dmd` for a transformer distilled for a few steps; `diffusion/chunking.py`), the
+  VAE decoded in tiles (`diffusion/tiling.py`, `load_wan_vae`) and the pipeline that runs
+  the stages one at a time (`diffusion/sequential.py`, `adapters/wan_pipeline.py`:
+  `load_wan_pipeline`). Exit criterion: 720p x 49 frames, and
   480p x 121 as the long mode (the model does not guarantee quality at 480p), within 3.4 GB
   of VRAM. `bench_video` holds a whole generation to it, and both sizes pass. Measured on
   Wan 2.2 TI2V-5B with 2 slots, 50 guided steps, the GPU going from 60 to 77 °C:
@@ -44,7 +45,15 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
   resident), with 2.98 and 3.04 GB of VRAM at the peak of the process as the driver counts
   it and 0.80 GiB of weights in VRAM. Latents equal to the strict baseline bit for bit at
   both sizes, and to `WanPipeline` at 480p x 17; the tiled decode is 49.4 dB from the
-  untiled float32 one. Left: sampling in few steps (FastWan).
+  untiled float32 one.
+  In three steps without guidance, with the transformer of FastWan 2.2 TI2V-5B
+  (`load_wan_pipeline(transformer=, dmd_timesteps=)`), under the same 3.4 GB: 720p x 49 in
+  180 s and 480p x 121 in 181 s (48 and 51 s in the transformer, 125 and 123 s in the VAE,
+  now 70 % of the time), 2.94 and 3.00 GB at the peak, latents equal to the strict baseline
+  bit for bit, 49.3 and 49.4 dB. 720p x 121, which is outside the criterion, also runs
+  within 3.4 GB, with one slot and the FFN in chunks: 458 s (138 s in the transformer, 313 s
+  in the VAE), 3.01 GB, 48.8 dB; with all the VRAM this laptop has free (two slots, the VAE
+  in bf16 streamed) it takes 395 s and 3.34 GB. Left: the results in the README.
 - F1 exit criterion, measured with `bench_llm` on Qwen3-8B (2 slots, all blocks in RAM): same
   tokens as the strict baseline, 0.77 GB of weights in VRAM, prefill overlap efficiency
   0.90-1.00; 2.28 s/token against 2.88 with `accelerate` offloading, at a third of its peak VRAM.
@@ -69,13 +78,16 @@ bash scripts/setup_linux.sh
 source .venv/bin/activate
 
 pytest -q                       # tests, without the slow ones
-pytest -q -m slow -rs           # the slow ones: real checkpoints (HYPERTIER_MODELS), ~20 minutes
+pytest -q -m slow -rs           # the slow ones: real checkpoints (HYPERTIER_MODELS), ~32 minutes
 TRITON_INTERPRET=1 pytest -q    # run Triton kernels on CPU (no GPU needed)
 python benchmarks/bench_hw.py   # hardware profile -> benchmarks/results/hw_*.json (--quick: smoke)
 python benchmarks/bench_streaming.py  # streaming vs resident model -> results/streaming_*.json
 python benchmarks/bench_streaming.py --checkpoint "$HYPERTIER_MODELS/Qwen3-8B"  # real layers
 python benchmarks/bench_llm.py --model "$HYPERTIER_MODELS/Qwen3-8B"  # tokens, VRAM, prefill overlap
 python benchmarks/bench_video.py --model "$HYPERTIER_MODELS/Wan2.2-TI2V-5B-Diffusers"  # F3 criterion
+python benchmarks/bench_video.py --model "$HYPERTIER_MODELS/Wan2.2-TI2V-5B-Diffusers" \
+  --transformer "$HYPERTIER_MODELS/FastWan2.2-TI2V-5B-FullAttn-Diffusers/transformer" \
+  --dmd-timesteps 1000,757,522  # the same in three steps, with a distilled transformer
 ruff check .                    # lint (line length 100, target py310)
 python -m build                 # build sdist + wheel
 ```
@@ -211,6 +223,14 @@ Create modules only when the current phase needs them.
    the weights with the same bits. Two passes stay the default: one pass only wins while the
    copy of a block outlasts its compute, below about 2,000 tokens on the reference laptop
    (at 1,950 they tie: 3.58 s per step against 3.64, with 0.2 GiB more).
+   A transformer distilled for a few steps (FastWan 2.2 TI2V-5B: timesteps 1000, 757, 522, no
+   guidance) has a loop of its own, `denoise_dmd`. `diffusers` has no pipeline to be equal to,
+   so it follows the loop of FastVideo and is compared bit for bit with that loop transcribed
+   operation by operation. What changes the numbers: the sigma of a timestep is read on a
+   schedule with shift 8, not the 5 of the scheduler in the checkpoint; the transformer gets
+   one timestep per sample; the clean video is computed in float64 and kept in bf16; all noise
+   comes from one CPU generator as `[1, frames, channels, height, width]`, in float32 at the
+   start and in bf16 after each step (a bf16 draw is not the float32 draw rounded).
 
 10. **A stage is admitted before it is loaded.** A pipeline runs its stages one at a time
     (`SequentialPipeline`, `load_wan_pipeline`): text encoder, transformer, VAE, each loaded
@@ -224,11 +244,19 @@ Create modules only when the current phase needs them.
     the allocator reserved it: text 912 MiB; the transformer by tokens (`TRANSFORMER_PEAKS`:
     135 KB per token, 85 KB with the FFN in chunks, measured up to 20,240 tokens with two
     slots, 23,760 with one, and 27,280 in chunks, which is 720p x 121); the VAE by
-    configuration and length. Like is compared with like: a peak is what PyTorch's allocator
-    reserved in a run of its own plus `CUDA_CONTEXT`, and the budget is the VRAM free after
-    `empty_cache()` plus what the process holds, read from the driver. The 3.4 GB of the F3
-    criterion is a third thing, the peak of the process as the driver counts it, which
-    `bench_video` samples during a whole generation.
+    configuration and length. **A peak belongs to a way of running**: what the allocator
+    reserves follows the order of the allocations, not only their size. A few steps
+    (`denoise_dmd`) have rows of their own, 12 to 146 MiB under the guided ones, and 4 to 72
+    over at 11,440 tokens. Read on the guided rows, 720p x 121 reserved 160 MiB more than
+    promised: the third pass reserved 320 MiB again, cut out of the cache by what the loop
+    allocates between passes. `denoise_dmd` empties the allocator's cache before every pass,
+    in the same time, so a pass no longer pays for what ran before it. That is measured, not
+    a rule: emptied before every latent frame, the VAE reserves 116 to 256 MiB more.
+    Like is compared with like: a peak is what PyTorch's allocator reserved in a run of its
+    own plus `CUDA_CONTEXT`, and the budget is the VRAM free after `empty_cache()` plus what
+    the process holds, read from the driver. The 3.4 GB of the F3 criterion is a third thing,
+    the peak of the process as the driver counts it, which `bench_video` samples during a
+    whole generation.
     The CUDA context **grows while the stages run**: CUDA loads each kernel the first time it
     is used, so every new kind of operation adds a little and the first stage adds most.
     Outside the allocator a process holds 77 MiB when created, 123 after the text stage and
