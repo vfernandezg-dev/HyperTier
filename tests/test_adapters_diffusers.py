@@ -25,7 +25,12 @@ from pathlib import Path
 import pytest
 
 from hypertier.adapters import hf_diffusers
-from hypertier.adapters.hf_diffusers import denoise, load_wan_transformer
+from hypertier.adapters.hf_diffusers import (
+    denoise,
+    denoise_dmd,
+    dmd_sigmas,
+    load_wan_transformer,
+)
 from hypertier.diffusion import chunk_tokens, runs_one_sample_at_a_time
 
 MiB = 1 << 20
@@ -332,6 +337,166 @@ def test_one_pass_of_guidance_copies_the_weights_once_per_step(diffusers, disk_t
             passes.append(len(ours.streamer.pass_stats()) - before)
     assert passes == [10, 5]
     assert torch.equal(results[0], results[1])
+
+
+# ---------------------------------------------------------------------------------------------
+# A few steps, with a distilled transformer
+
+FEW_STEPS = (1000, 757, 522)  # the timesteps FastWan is distilled for
+
+
+def test_the_sigmas_of_a_few_steps_are_read_on_a_schedule_with_shift_8():
+    torch = pytest.importorskip("torch")
+    sigmas = dmd_sigmas(torch, FEW_STEPS)
+    assert sigmas.dtype == torch.float32 and sigmas.device.type == "cpu"
+    # 1, 28/37 and 12/23 as the float32 arithmetic of the schedule leaves them.
+    assert [value.item().hex() for value in sigmas] == [
+        "0x1.0000000000000p+0", "0x1.83759e0000000p-1", "0x1.0b21640000000p-1",
+    ]  # fmt: skip
+    assert sigmas.tolist() == pytest.approx([1.0, 28 / 37, 12 / 23], abs=1e-7)
+    # The nearest timestep of the table, which has 756.76 and 757.67 but none at 757.
+    assert dmd_sigmas(torch, (758,)).tolist() == pytest.approx([8 * 0.281 / (1 + 7 * 0.281)])
+    assert not torch.equal(dmd_sigmas(torch, (758,)), sigmas[1:2])
+    # The shift of the scheduler in the checkpoint is not the one of the sampler.
+    assert dmd_sigmas(torch, FEW_STEPS, shift=5.0).tolist() == pytest.approx(
+        [1.0, 0.7570978, 0.5215617], abs=1e-7
+    )
+    assert dmd_sigmas(torch, (1,), shift=1.0).tolist() == pytest.approx([0.001])
+
+
+def fastvideo_loop(model, cond, steps, generator):
+    """The few-step loop as FastVideo runs it, operation by operation.
+
+    Transcribed from ``DmdDenoisingStage``, ``pred_noise_to_pred_video`` and the ``add_noise``
+    of its flow-matching scheduler (github.com/hao-ai-lab/FastVideo, Apache-2.0), around a
+    ``WanTransformer3DModel`` of ``diffusers``: latents as ``[batch, frames, channels, height,
+    width]``, every frame a row with a sigma of its own looked up in the table.
+    """
+    import numpy as np
+    import torch
+
+    timesteps = np.linspace(1, 1000, 1000, dtype=np.float32)[::-1].copy()
+    sigmas = torch.from_numpy(timesteps).to(torch.float32) / 1000
+    sigmas = 8.0 * sigmas / (1 + (8.0 - 1) * sigmas)
+    table = (sigmas * 1000).to("cuda")
+    sigmas = sigmas.to("cuda")
+    frames, height, width = LATENT
+    shape = (1, frames, CHANNELS, height, width)
+    latents = torch.randn(shape, generator=generator, dtype=torch.float32).to("cuda")
+    steps = torch.tensor(steps, dtype=torch.long, device="cuda")
+    for i, t in enumerate(steps):
+        noise_latents = latents.clone()
+        t_expand = t.repeat(latents.shape[0])
+        with torch.no_grad():
+            pred_noise = run(
+                model, latents.to(model.dtype).permute(0, 2, 1, 3, 4), t_expand, cond
+            ).permute(0, 2, 1, 3, 4)
+        # pred_noise_to_pred_video: float64, the sigma of the nearest timestep of the table
+        rows = pred_noise.flatten(0, 1)
+        timestep = t_expand.expand(rows.shape[0])
+        nearest = torch.argmin((table.double().unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+        sigma_t = sigmas.double()[nearest].reshape(-1, 1, 1, 1)
+        pred_video = noise_latents.flatten(0, 1).double() - sigma_t * rows.double()
+        pred_video = pred_video.to(rows.dtype).unflatten(0, pred_noise.shape[:2])
+        if i < len(steps) - 1:
+            next_timestep = steps[i + 1] * torch.ones([1], dtype=torch.long, device="cuda")
+            noise = torch.randn(shape, dtype=pred_video.dtype, generator=generator).to("cuda")
+            # add_noise: float32
+            clean, noise_rows = pred_video.flatten(0, 1), noise.flatten(0, 1)
+            timestep = next_timestep.expand(clean.shape[0])
+            nearest = torch.argmin((table.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+            sigma = sigmas[nearest].reshape(-1, 1, 1, 1)
+            sample = (1 - sigma) * clean + sigma * noise_rows
+            latents = sample.type_as(noise_rows).unflatten(0, pred_video.shape[:2])
+        else:
+            latents = pred_video
+    return latents.permute(0, 2, 1, 3, 4)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+def test_a_few_steps_give_the_latents_of_the_loop_of_fastvideo(diffusers, disk_tmp, dtype):
+    import torch
+
+    tiny_wan_transformer(disk_tmp)
+    want = reference(disk_tmp, dtype)
+    with load_wan_transformer(disk_tmp, dtype=dtype) as ours:
+        for seed, text_tokens, steps in [
+            (0, 20, FEW_STEPS), (1024, 20, FEW_STEPS), (7, 9, FEW_STEPS), (3, 33, (1000, 500)),
+            (5, 20, (1000,)), (2, 20, (999, 800, 600, 400, 200)),
+        ]:  # fmt: skip
+            cond = inputs(dtype, seed=100 + seed, text_tokens=text_tokens)[1]
+            expected = fastvideo_loop(want, cond, steps, torch.Generator("cpu").manual_seed(seed))
+            assert bool(torch.isfinite(expected).all()) and float(expected.float().std()) > 0.1
+            for model in (ours.model, want):  # streamed, and the same loop on the resident one
+                got = denoise_dmd(
+                    model, cond, latent_shape=LATENT, timesteps=steps,
+                    generator=torch.Generator("cpu").manual_seed(seed),
+                )  # fmt: skip
+                assert got.shape == (1, CHANNELS, *LATENT) and got.device.type == "cuda"
+                assert got.dtype == expected.dtype == getattr(torch, dtype)
+                assert torch.equal(got, expected), (seed, text_tokens, steps)
+
+
+@pytest.mark.cuda
+def test_a_few_steps_are_one_pass_each_with_one_timestep_per_sample(diffusers, disk_tmp):
+    import torch
+
+    tiny_wan_transformer(disk_tmp)
+    cond = inputs("bfloat16", text_tokens=20)[1]
+    frames, height, width = LATENT
+    with load_wan_transformer(disk_tmp) as ours:
+        seen = []
+        spy = ours.model.register_forward_pre_hook(
+            lambda module, args, kwargs: seen.append(kwargs["timestep"].clone()), with_kwargs=True
+        )
+        generator = torch.Generator("cpu").manual_seed(11)
+        drawn = denoise_dmd(
+            ours.model, cond, latent_shape=LATENT, timesteps=FEW_STEPS, generator=generator
+        )
+        assert len(ours.streamer.pass_stats()) == 3, "no guidance: one pass per step"
+        assert [tuple(t.shape) for t in seen] == [(1,)] * 3, "not one timestep per token"
+        assert all(t.dtype == torch.long for t in seen)
+        assert [int(t) for t in seen] == list(FEW_STEPS), "the nominal ones, not the table's"
+        # The initial noise is the first draw of the generator, as [1, frames, channels, ...].
+        generator = torch.Generator("cpu").manual_seed(11)
+        noise = torch.randn(1, frames, CHANNELS, height, width, generator=generator)
+        given = denoise_dmd(
+            ours.model, cond, latent_shape=LATENT, timesteps=FEW_STEPS, generator=generator,
+            latents=noise.permute(0, 2, 1, 3, 4),
+        )  # fmt: skip
+        assert torch.equal(given, drawn)
+        other = denoise_dmd(
+            ours.model, cond, latent_shape=LATENT, timesteps=FEW_STEPS,
+            generator=torch.Generator("cpu").manual_seed(12), latents=noise.permute(0, 2, 1, 3, 4),
+        )  # fmt: skip
+        assert not torch.equal(other, drawn), "the noise added back comes from the generator"
+        spy.remove()
+
+
+@pytest.mark.cuda
+def test_a_few_steps_refuse_what_they_would_get_wrong(diffusers, disk_tmp):
+    import torch
+
+    tiny_wan_transformer(disk_tmp)
+    plain = reference(disk_tmp, "bfloat16")
+    text = inputs("bfloat16", batch=2)[1]
+
+    def sample(embeds=text[:1], **changes):
+        return denoise_dmd(plain, embeds, **{"latent_shape": LATENT, "timesteps": FEW_STEPS, **changes})
+
+    with pytest.raises(ValueError, match="samples one video"):
+        sample(text)
+    for wrong in ((), (522, 757, 1000), (1000, 757, 757)):
+        with pytest.raises(ValueError, match="go down"):
+            sample(timesteps=wrong)
+    with pytest.raises(ValueError, match="drawn on the CPU"):
+        sample(generator=torch.Generator("cuda").manual_seed(0))
+    with pytest.raises(ValueError, match="does not divide into patches"):
+        sample(latent_shape=(3, 7, 8))
+    with pytest.raises(ValueError, match="latent_shape asks for"):
+        sample(latents=torch.zeros(1, CHANNELS, 3, 8, 4))
+    assert sample(timesteps=(1000,)).shape == (1, CHANNELS, *LATENT)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -649,3 +814,46 @@ def test_the_real_chunked_ffn_stays_within_the_rounding_of_one_pass(
         f"chunks of 512 moves it {error:.2e}, {error / noise:.2f} of that"
     )
     assert error <= CHUNKED_OVER_NOISE * noise
+
+
+
+# ---------------------------------------------------------------------------------------------
+# A real distilled model: FastWan 2.2 TI2V-5B (needs HYPERTIER_MODELS)
+
+FAST = "FastWan2.2-TI2V-5B-FullAttn-Diffusers"
+
+
+@pytest.fixture(scope="module")
+def fast_dir():
+    root = os.environ.get("HYPERTIER_MODELS")
+    if not root or not (Path(root) / FAST / "transformer").is_dir():
+        pytest.skip(f"set HYPERTIER_MODELS to a directory that holds {FAST}")
+    pytest.importorskip("diffusers")
+    return Path(root) / FAST / "transformer"
+
+
+@pytest.mark.slow
+@pytest.mark.cuda
+def test_the_real_distilled_model_gives_the_latents_of_the_strict_baseline(fast_dir):
+    """Three steps at 480p x 17 frames, streamed, against a blocking copy per block."""
+    import torch
+
+    embeds = real_embeds(0, 27)[:1]
+
+    def sample(model):
+        return denoise_dmd(
+            model, embeds, latent_shape=SMALL, timesteps=FEW_STEPS,
+            generator=torch.Generator("cpu").manual_seed(1024),
+        ).cpu()  # fmt: skip
+
+    expected = sample(strict_baseline(fast_dir))
+    gc.collect()
+    torch.cuda.empty_cache()
+    assert expected.shape == (1, 48, *SMALL) and expected.dtype == torch.bfloat16
+    assert bool(torch.isfinite(expected).all()) and 0.5 < float(expected.float().std()) < 2
+    torch.cuda.reset_peak_memory_stats()
+    with load_wan_transformer(fast_dir) as ours:
+        got = sample(ours.model)
+        stats = ours.streamer.pass_stats()
+    print(f"\n[fastwan] 1950 tokens, 3 steps: peak {peak(torch)}, {len(stats)} passes")
+    assert len(stats) == 3 and torch.equal(got, expected)
