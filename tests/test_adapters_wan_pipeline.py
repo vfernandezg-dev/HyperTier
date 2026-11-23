@@ -195,6 +195,48 @@ def test_prompts_are_kept_by_their_cleaned_text(diffusers, disk_tmp):
         assert not ours._prompts
 
 
+@pytest.mark.cuda
+def test_a_distilled_transformer_samples_in_a_few_steps_without_guidance(diffusers, disk_tmp):
+    import torch
+
+    from hypertier.adapters.hf_diffusers import denoise_dmd
+
+    base = tiny_wan_pipeline(disk_tmp / "base")
+    distilled = tiny_wan_pipeline(disk_tmp / "distilled", seed=5) / "transformer"
+    steps = (1000, 757, 522)
+    resident = diffusers.WanTransformer3DModel.from_pretrained(
+        distilled, torch_dtype=torch.bfloat16
+    )
+    resident = resident.to("cuda").eval()
+    few = {"transformer": distilled, "dmd_timesteps": steps}
+    with load_wan_pipeline(base, **few, vae_config=WHOLE) as ours:
+        assert ours.transformer_dir == distilled and ours.dmd_timesteps == steps
+        result = ours(PROMPT, NEGATIVE, **SIZE, seed=1024, one_pass=True)
+        text, transformer, _ = result.stages.values()
+        assert text.details["prompts"] == 1, "no guidance: the negative prompt is not encoded"
+        assert transformer.details["steps"] == 3 and transformer.details["passes"] == 3
+        assert transformer.details["dmd_timesteps"] == [1000, 757, 522]
+        embeds = ours.encode([PROMPT])
+        expected = denoise_dmd(
+            resident, embeds, latent_shape=ours.latent_shape(**SIZE), timesteps=steps,
+            generator=torch.Generator("cpu").manual_seed(1024),
+        ).cpu()  # fmt: skip
+        assert result.latents.dtype == torch.bfloat16
+        assert torch.equal(result.latents, expected), "the loop on the resident transformer"
+        assert result.frames.shape == (9, 96, 160, 3) and result.frames.dtype == torch.uint8
+        assert float(result.frames.float().std()) > 5
+        alone = ours.denoise(embeds, embeds, **SIZE, seed=1024, guidance_scale=7.0)
+        assert torch.equal(alone, expected), "guidance and the negative prompt are not used"
+    with load_wan_pipeline(base, transformer=distilled) as plain:
+        assert plain.dmd_timesteps is None  # another transformer, the scheduler of the pipeline
+        latents = plain.denoise(embeds, **SIZE, num_inference_steps=3, guidance_scale=1.0)
+        assert latents.dtype == torch.float32 and not torch.equal(latents, expected.float())
+    with pytest.raises(ValueError, match="dmd_timesteps is empty"):
+        load_wan_pipeline(base, dmd_timesteps=())
+    with pytest.raises(ValueError, match="config.json is missing"):
+        load_wan_pipeline(base, transformer=disk_tmp / "nowhere")
+
+
 # ---------------------------------------------------------------------------------------------
 # What is refused before anything is loaded
 
@@ -276,6 +318,9 @@ def test_a_generation_that_does_not_fit_is_refused_with_what_would(measured):
     measured.slots = 1
     measured.set_available(one + VRAM_MARGIN)
     assert measured.check(**size)["transformer"] == one
+    # A distilled transformer has no guidance to run in one pass: counted as it runs.
+    measured.dmd_timesteps = (1000, 757, 522)
+    assert measured.check(**size, one_pass=True)["transformer"] == one
 
 
 @pytest.mark.cuda

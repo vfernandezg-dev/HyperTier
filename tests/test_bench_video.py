@@ -43,6 +43,19 @@ def test_the_default_is_the_main_size_of_the_criterion_and_quick_is_short(bench)
         bench.parse_args([])
 
 
+def test_a_distilled_transformer_takes_its_steps_from_its_timesteps(bench):
+    few = ["--model", "m", "--transformer", "fast/transformer", "--dmd-timesteps", "1000,757,522"]
+    parsed = bench.parse_args([*few, "--ffn-chunk", "2048"])
+    cfg = bench.make_config(parsed)
+    assert cfg.dmd_timesteps == (1000, 757, 522) and cfg.steps == 3 and cfg.ffn_chunk == 2048
+    assert parsed.transformer == Path("fast/transformer")
+    assert bench.make_config(bench.parse_args([*few, "--steps", "3"])).steps == 3
+    with pytest.raises(SystemExit, match="leave it out"):
+        bench.make_config(bench.parse_args([*few, "--steps", "50"]))
+    plain = bench.make_config(bench.parse_args(["--model", "m"]))
+    assert plain.dmd_timesteps is None and plain.ffn_chunk is None and plain.steps == 50
+
+
 def test_every_worker_gets_the_cublas_workspace_and_stays_offline(bench, monkeypatch):
     monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG", raising=False)
     env = bench.worker_env()
@@ -137,6 +150,12 @@ def test_the_summary_shows_every_stage_and_every_check(bench):
     assert "within the VRAM budget                 yes" in text
     assert "same latents as the strict baseline    yes (2 steps)" in text
     assert "NO (37.9 dB over 9 frames, at least 38.4)" in text
+    few = {**cfg, "dmd_timesteps": [1000, 757, 522], "steps": 3, "ffn_chunk": 2048}
+    distilled = {**results, "transformer": "FastWan", "steps": {"strict": {"steps": 2}}}
+    text = bench.format_summary({"config": few, "results": distilled})
+    assert "49 frames, 3 steps at 1000, 757, 522, no guidance, 2 slots, the FFN 2048 tokens" in text
+    assert "\n  transformer         FastWan\n" in text
+    assert "same latents as the strict baseline    yes (2 steps)" in text
     unchecked = {"generate": generated, "checks": {}}
     assert bench.format_summary({"config": cfg, "results": unchecked}).count("not checked") == 3
     failed = {"generate": {"error": "ValueError: does not fit"}, "checks": {}}
@@ -189,3 +208,39 @@ def test_quick_run_end_to_end(bench, disk_tmp, tmp_path, capsys):
     assert res["psnr"]["frames"] == 5 and res["psnr"]["db"] > 45
     assert res["steps"]["strict"]["steps"] == 2
     assert "same latents as the strict baseline    yes (2 steps)" in said
+
+
+
+@pytest.mark.cuda
+def test_quick_run_with_a_distilled_transformer(bench, disk_tmp, tmp_path, capsys):
+    pytest.importorskip("diffusers")
+    base = tiny_wan_pipeline(disk_tmp / "base")
+    distilled = tiny_wan_pipeline(disk_tmp / "distilled", seed=5) / "transformer"
+    out_dir = tmp_path / "results"
+    common = ["--model", str(base), "--transformer", str(distilled), "--dmd-timesteps",
+              "1000,757,522", "--height", "96", "--width", "160", "--frames", "9", "--warm-up", "0",
+              "--vram-budget-gb", "0", "--vae-config", "fp32-streamed", "--no-video",
+              "--out-dir", str(out_dir)]  # fmt: skip
+    assert bench.main([*common, "--check-steps", "2", "--psnr-frames", "5"]) == 0
+    (path,) = out_dir.glob("video_*.json")
+    payload = json.loads(path.read_text())
+    assert str(disk_tmp) not in path.read_text(), "names, not where the models are"
+    res = payload["results"]
+    assert res["model"] == "base" and res["transformer"] == "distilled"
+    assert payload["config"]["dmd_timesteps"] == [1000, 757, 522] and payload["config"]["steps"] == 3
+    sampled = res["generate"]["stages"]["transformer"]["details"]
+    assert sampled["passes"] == 3 and sampled["dmd_timesteps"] == [1000, 757, 522]
+    assert res["generate"]["stages"]["text"]["details"]["prompts"] == 1
+    assert res["checks"] == {"latents_equal_strict_baseline": True, "psnr_above_threshold": True}
+    assert res["steps"]["strict"]["steps"] == 2
+    said = capsys.readouterr().out
+    assert "3 steps at 1000, 757, 522, no guidance" in said
+    assert "same latents as the strict baseline    yes (2 steps)" in said
+    path.unlink()
+    # In chunks the feed-forward networks are not exact: the latents are not compared.
+    assert bench.main([*common, "--ffn-chunk", "16", "--psnr-frames", "0"]) == 0
+    (path,) = out_dir.glob("video_*.json")
+    res = json.loads(path.read_text())["results"]
+    assert res["checks"] == {} and "steps" not in res
+    assert res["generate"]["stages"]["transformer"]["details"]["ffn_chunk"] == 16
+    assert "same latents as the strict baseline    not checked" in capsys.readouterr().out
