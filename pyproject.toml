@@ -42,9 +42,12 @@ hf = ["transformers>=5.24"]
 diffusers = ["diffusers>=0.43", "transformers>=5.24", "ftfy"]
 dev = ["pytest>=8", "ruff>=0.6", "build", "twine"]
 # What the model tests and bench_llm need on a machine with a GPU, besides torch. accelerate
-# is only a baseline to compare against: nothing in the package imports it. CI installs
-# "dev" alone and skips these tests.
-test = ["transformers>=5.24", "accelerate>=1.16", "diffusers>=0.43", "ftfy"]
+# is only a baseline to compare against: nothing in the package imports it. nvidia-ml-py
+# (BSD) is optional at run time: with it the VRAM of the process is read through NVML, and
+# without it through nvidia-smi; it is here so that the tests run the first way (tested with
+# 13.615; one too old to be used falls back to nvidia-smi). CI installs "dev" alone and skips
+# these tests.
+test = ["transformers>=5.24", "accelerate>=1.16", "diffusers>=0.43", "ftfy", "nvidia-ml-py"]
 # bench_video writes its video as an MP4 with these, and as an animated WebP without them.
 # 2.38 and 0.8 are the oldest releases it is tested with. Not part of "test": both are
 # BSD-2-Clause, but the wheel of imageio-ffmpeg carries an ffmpeg executable under the GPL

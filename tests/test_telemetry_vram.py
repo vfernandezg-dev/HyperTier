@@ -3,6 +3,10 @@
 
 """Tests for hypertier.telemetry.vram."""
 
+import os
+import sys
+import types
+
 import pytest
 
 from hypertier.telemetry import GiB, MiB, vram
@@ -84,6 +88,88 @@ def test_the_vram_of_a_process_is_read_from_the_listing_of_the_driver():
     assert vram.parse_compute_apps("No running processes found\n", 100, None) is None
 
 
+def fake_nvml(devices, *, init_fails=False):
+    """A stand-in for the module ``pynvml``: ``devices`` is {uuid: [(pid, bytes or None)]}."""
+    module = types.ModuleType("pynvml")
+
+    class NVMLError(Exception):
+        pass
+
+    def init():
+        module.inits += 1
+        if init_fails:
+            raise NVMLError("the library of the driver was not found")
+
+    def by_uuid(uuid):
+        if uuid not in devices:
+            raise NVMLError("no such GPU")
+        return uuid
+
+    def processes(handle):
+        return [types.SimpleNamespace(pid=pid, usedGpuMemory=used) for pid, used in devices[handle]]
+
+    module.NVMLError, module.inits = NVMLError, 0
+    module.nvmlInit, module.nvmlShutdown = init, lambda: None
+    module.nvmlDeviceGetHandleByUUID = by_uuid
+    module.nvmlDeviceGetCount = lambda: len(devices)
+    module.nvmlDeviceGetHandleByIndex = lambda index: list(devices)[index]
+    module.nvmlDeviceGetComputeRunningProcesses = processes
+    return module
+
+
+def install(monkeypatch, module):
+    """Make ``import pynvml`` give ``module`` (None: not installed), not tried yet."""
+    monkeypatch.setitem(sys.modules, "pynvml", module)
+    monkeypatch.setattr(vram, "_nvml_loaded", [])
+    monkeypatch.setattr(vram.atexit, "register", lambda function: function)
+    return module
+
+
+def test_the_vram_of_a_process_is_read_through_nvml_when_it_is_installed(monkeypatch):
+    devices = {
+        "GPU-aaaa": [(100, 278 * MiB), (200, 1024 * MiB)],
+        "GPU-bbbb": [(200, 64 * MiB), (300, None)],
+    }
+    nvml = install(monkeypatch, fake_nvml(devices))
+    ask = vram._process_vram_nvml
+    assert ask(100, "GPU-aaaa") == 278 * MiB
+    assert ask(200, "GPU-bbbb") == 64 * MiB
+    assert ask(100, None) == 278 * MiB
+    assert ask(200, None) is None, "on two GPUs: which one?"
+    assert ask(400, "GPU-aaaa") is None, "not listed"
+    assert ask(100, "GPU-bbbb") is None
+    assert ask(300, "GPU-bbbb") is None, "the driver does not say (WSL2)"
+    assert nvml.inits == 1, "NVML is initialised once and kept"
+    # NVML that cannot be asked is not NVML that does not know: nvidia-smi is asked then.
+    assert ask(100, "GPU-cccc") is vram._NOT_ASKED, "a call that fails"
+    assert ask(100, "GPU-aaaa") == 278 * MiB, "and the next one is asked again"
+    broken = install(monkeypatch, fake_nvml(devices, init_fails=True))
+    assert ask(100, "GPU-aaaa") is vram._NOT_ASKED and ask(100, "GPU-aaaa") is vram._NOT_ASKED
+    assert broken.inits == 1, "not tried again: the library will not appear"
+    install(monkeypatch, None)
+    assert ask(100, "GPU-aaaa") is vram._NOT_ASKED, "the bindings are not installed"
+
+
+@pytest.mark.cuda
+def test_nvidia_smi_is_asked_only_when_nvml_cannot_be(monkeypatch):
+    import torch
+
+    asked = []
+
+    def smi(pid, gpu_uuid):
+        asked.append((pid, gpu_uuid))
+        return 7 * MiB
+
+    monkeypatch.setattr(vram, "_process_vram_smi", smi)
+    monkeypatch.setattr(vram, "_process_vram_nvml", lambda pid, gpu_uuid: 5 * MiB)
+    assert vram.process_vram() == 5 * MiB and not asked
+    monkeypatch.setattr(vram, "_process_vram_nvml", lambda pid, gpu_uuid: None)
+    assert vram.process_vram() is None and not asked, "NVML answered: it does not know"
+    monkeypatch.setattr(vram, "_process_vram_nvml", lambda pid, gpu_uuid: vram._NOT_ASKED)
+    assert vram.process_vram() == 7 * MiB
+    assert asked == [(os.getpid(), f"GPU-{torch.cuda.get_device_properties(0).uuid}")]
+
+
 @pytest.mark.cuda
 def test_the_vram_of_this_process_is_its_allocator_and_its_context(monkeypatch):
     import torch
@@ -94,9 +180,19 @@ def test_the_vram_of_this_process_is_its_allocator_and_its_context(monkeypatch):
         pytest.skip("the driver does not say what this process holds")
     outside = held - torch.cuda.memory_reserved()
     assert held >= block.numel() and 40 * MiB < outside < 400 * MiB, "a CUDA context"
+    # Both ways read the same list of the driver.
+    me = (os.getpid(), f"GPU-{torch.cuda.get_device_properties(0).uuid}")
+    by_smi = vram._process_vram_smi(*me)
+    assert by_smi is not None and abs(by_smi - held) <= MiB
+    by_nvml = vram._process_vram_nvml(*me)
+    if by_nvml is vram._NOT_ASKED:
+        print("\n[vram] NVML bindings not installed: read through nvidia-smi")
+    else:
+        assert by_nvml == held, "NVML first"
 
     def missing(*args, **kwargs):
         raise FileNotFoundError("nvidia-smi")
 
+    install(monkeypatch, None)
     monkeypatch.setattr(vram.subprocess, "run", missing)
-    assert vram.process_vram() is None
+    assert vram.process_vram() is None, "neither can be asked"
