@@ -72,8 +72,9 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
 
 ```bash
 # one-time setup on Linux (apt deps, .venv, torch+triton, ".[dev,test]", verifies GPU, runs tests;
-# detects WSL2). The "test" extra is transformers, accelerate, diffusers and ftfy: the model
-# tests and bench_llm need it.
+# detects WSL2). The "test" extra is transformers, accelerate, diffusers and ftfy, which the
+# model tests and bench_llm need, and nvidia-ml-py: with it the VRAM of the process is read
+# through NVML, without it through nvidia-smi.
 bash scripts/setup_linux.sh
 source .venv/bin/activate
 

@@ -12,6 +12,8 @@ streaming slots are judged by the first.
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import os
 import subprocess
 from collections.abc import Iterator
@@ -126,13 +128,94 @@ def process_vram(device: Any = None) -> int | None:
 
     Everything the process holds: PyTorch's allocator, and what no counter of PyTorch shows,
     which is the CUDA context, the kernels loaded into it as they are first used, and the
-    driver's bookkeeping for page-locked RAM. Read through ``nvidia-smi``, which needs no
-    dependency (about 20 ms). None when it is missing or fails, when the driver keeps no
-    figure per process (WSL2), and when this process is not in its list, as in a container
-    with process IDs of its own.
+    driver's bookkeeping for page-locked RAM.
+
+    Read through NVML when its Python bindings are installed (``nvidia-ml-py``, the module
+    ``pynvml``): a call into the driver's own library, 0.07 ms on the reference laptop once
+    the library is loaded, which takes 8 ms the first time. Without them, or when NVML
+    cannot be asked, through ``nvidia-smi``: no dependency, and a process to start every
+    time (24 ms). Both read the same list and give the same figure.
+
+    None when neither can be asked, when the driver keeps no figure per process (WSL2), and
+    when this process is not in its list, as in a container with process IDs of its own.
     """
     torch = require_cuda()
     dev = resolve_device(device)
+    uuid = getattr(torch.cuda.get_device_properties(dev), "uuid", None)
+    gpu_uuid = None if uuid is None else f"GPU-{uuid}"
+    held = _process_vram_nvml(os.getpid(), gpu_uuid)
+    if held is _NOT_ASKED:
+        held = _process_vram_smi(os.getpid(), gpu_uuid)
+    return held
+
+
+_NOT_ASKED: Any = object()
+"""What :func:`_process_vram_nvml` returns when NVML could not be asked at all, which is not
+the same as NVML answering that it does not know."""
+
+_nvml_loaded: list[Any] = []
+"""Empty until NVML was tried; then the module ``pynvml`` with NVML initialised, or None."""
+
+
+def _nvml() -> Any:
+    """The module ``pynvml`` with NVML initialised, or None when it cannot be used.
+
+    Tried once and kept for the life of the process: the bindings are not installed, or the
+    library of the driver is not found, for good. NVML is shut down when the interpreter
+    exits.
+    """
+    if not _nvml_loaded:
+        try:
+            import pynvml
+        except ImportError:
+            _nvml_loaded.append(None)
+            return None
+        try:
+            pynvml.nvmlInit()
+        except pynvml.NVMLError:
+            _nvml_loaded.append(None)
+            return None
+
+        def shutdown() -> None:
+            with contextlib.suppress(pynvml.NVMLError):
+                pynvml.nvmlShutdown()
+
+        atexit.register(shutdown)
+        _nvml_loaded.append(pynvml)
+    return _nvml_loaded[0]
+
+
+def _process_vram_nvml(pid: int, gpu_uuid: str | None) -> int | None:
+    """Bytes of ``pid`` on the GPU ``gpu_uuid`` as NVML lists it, or None if it does not say.
+
+    :data:`_NOT_ASKED` when NVML cannot be used or a call fails: the caller then asks
+    ``nvidia-smi``. Without a UUID the process has to be listed on one GPU only, as in
+    :func:`parse_compute_apps`.
+    """
+    pynvml = _nvml()
+    if pynvml is None:
+        return _NOT_ASKED
+    try:
+        if gpu_uuid is not None:
+            handles = [pynvml.nvmlDeviceGetHandleByUUID(gpu_uuid)]
+        else:
+            count = pynvml.nvmlDeviceGetCount()
+            handles = [pynvml.nvmlDeviceGetHandleByIndex(index) for index in range(count)]
+        found = [
+            process.usedGpuMemory
+            for handle in handles
+            for process in pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+            if process.pid == pid
+        ]
+    except (pynvml.NVMLError, TypeError):  # TypeError: bindings from before strings were taken
+        return _NOT_ASKED
+    if len(found) != 1 or found[0] is None:  # None: the driver does not say (WSL2)
+        return None
+    return int(found[0])
+
+
+def _process_vram_smi(pid: int, gpu_uuid: str | None) -> int | None:
+    """The same from the listing of ``nvidia-smi``; None also when it is missing or fails."""
     command = ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_memory",
                "--format=csv,noheader,nounits"]  # fmt: skip
     try:
@@ -141,8 +224,7 @@ def process_vram(device: Any = None) -> int | None:
         return None
     if done.returncode != 0:
         return None
-    uuid = getattr(torch.cuda.get_device_properties(dev), "uuid", None)
-    return parse_compute_apps(done.stdout, os.getpid(), None if uuid is None else f"GPU-{uuid}")
+    return parse_compute_apps(done.stdout, pid, gpu_uuid)
 
 
 def parse_compute_apps(listing: str, pid: int, gpu_uuid: str | None) -> int | None:
