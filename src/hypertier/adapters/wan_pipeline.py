@@ -1,0 +1,563 @@
+# Copyright 2026 The HyperTier Authors
+# SPDX-License-Identifier: Apache-2.0
+
+"""Text to video with a Wan pipeline of ``diffusers`` on a GPU that holds none of its models.
+
+:func:`load_wan_pipeline` reads a local ``WanPipeline`` directory and returns an object that
+runs its three stages one after another, each loaded only while it runs
+(:class:`~hypertier.diffusion.sequential.SequentialPipeline`)::
+
+    text         umT5 encoder, blocks read from disk on every call   (load_text_encoder)
+    transformer  blocks streamed from page-locked RAM                (load_wan_transformer)
+    vae          decoder in tiles, in the best configuration that fits (load_wan_vae)
+
+The latents are those of ``WanPipeline`` bit for bit, because every stage does what
+``diffusers`` does: prompts are cleaned and tokenized the same way and encoded one at a time,
+and the sampling loop is :func:`~hypertier.adapters.hf_diffusers.denoise`. The frames are
+not: the VAE decodes in tiles, which is approximate (see
+:mod:`hypertier.diffusion.tiling`).
+
+Before anything is loaded, a generation is checked against the VRAM that is free, with the
+peaks measured for Wan 2.2 TI2V-5B: what does not fit is refused with what would.
+
+Needs the optional extra: ``pip install hypertier[diffusers]``. Importing this module imports
+neither PyTorch nor ``diffusers``.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from collections import OrderedDict
+from collections.abc import Sequence
+from dataclasses import dataclass
+from os import PathLike
+from pathlib import Path
+from statistics import median
+from typing import TYPE_CHECKING, Any
+
+from hypertier.adapters import _skeleton as skeleton
+from hypertier.adapters.hf_diffusers import (
+    VAE_CONFIGS,
+    VaeConfig,
+    _import_diffusers,
+    choose_vae_config,
+    denoise,
+    load_wan_transformer,
+    load_wan_vae,
+    usable_vae_configs,
+    vae_config_named,
+)
+from hypertier.adapters.hf_transformers import load_text_encoder
+from hypertier.diffusion.sequential import (
+    CUDA_CONTEXT,
+    VRAM_MARGIN,
+    SequentialPipeline,
+    StageReport,
+)
+from hypertier.io.safetensors_index import SafetensorsIndex
+from hypertier.telemetry._common import MiB
+
+if TYPE_CHECKING:
+    import torch
+    from typing_extensions import Self
+
+MAX_SEQUENCE_LENGTH = 512
+"""Tokens a prompt is padded or cut to, as in ``WanPipeline``."""
+
+CACHED_PROMPTS = 8
+"""Embeddings kept in memory, 4 MiB each for umT5-XXL: the negative prompt is the same in
+every call, and a prompt sampled again with another seed need not be encoded again."""
+
+TEXT_PEAK = 912 * MiB + CUDA_CONTEXT
+"""VRAM the process holds at the peak of the text stage: umT5-XXL through two slots, two
+prompts of 512 tokens (880 MiB of allocator for one prompt)."""
+
+TRANSFORMER_BASE = {1: 538 * MiB + CUDA_CONTEXT, 2: 852 * MiB + CUDA_CONTEXT}
+TRANSFORMER_PER_TOKEN = 134_850
+TRANSFORMER_ONE_PASS = 114_300
+"""The peak of the transformer stage of Wan 2.2 TI2V-5B: so much whatever the video, by the
+number of slots, plus so many bytes per token, plus so many more per token when both
+branches of the guidance share a pass.
+
+Fitted from above to what PyTorch's allocator reserved in runs of two guided steps, each in
+a process of its own, on the reference laptop::
+
+    tokens                1,950   5,070   11,440   12,090
+    two slots, MiB        1,098   1,502    2,304    2,402
+    one slot, MiB           784   1,188    1,990    2,088
+    two slots, one pass   1,310   2,034        -    3,236
+
+A slot is 312 MiB. One pass holds the time embedding of both branches at once before one row
+of it is kept, which is most of what it adds.
+"""
+
+
+@dataclass(frozen=True)
+class VideoResult:
+    """What a generation gives back.
+
+    Attributes:
+        frames: ``uint8`` frames ``[frames, height, width, 3]`` in host RAM.
+        latents: what the sampling loop returned, on the CPU: the input of the VAE stage.
+        stages: the :class:`~hypertier.diffusion.sequential.StageReport` of every stage that
+            ran, by name. The text stage is missing when every prompt was cached.
+        vae_config: the name of the VAE configuration that was chosen.
+    """
+
+    frames: torch.Tensor
+    latents: torch.Tensor
+    stages: dict[str, StageReport]
+    vae_config: str
+
+
+class WanVideoPipeline(SequentialPipeline):
+    """A ``WanPipeline`` directory, run a stage at a time. See :func:`load_wan_pipeline`."""
+
+    def __init__(
+        self,
+        model_dir: str | PathLike[str],
+        *,
+        slots: int = 2,
+        vae_config: VaeConfig | str | None = None,
+        vram_budget: int | None = None,
+        margin: int = VRAM_MARGIN,
+        device: torch.device | str = "cuda",
+    ) -> None:
+        super().__init__(device, vram_budget=vram_budget, margin=margin)
+        self._diffusers = _import_diffusers()
+        self.root = Path(model_dir)
+        self.slots = slots
+        if isinstance(vae_config, str):
+            vae_config = vae_config_named(vae_config)
+        self.vae_config = vae_config
+        index = _read_json(self.root / "model_index.json")
+        if index.get("_class_name") != "WanPipeline":
+            raise ValueError(
+                f"{self.root} holds a {index.get('_class_name')}; this runs a WanPipeline"
+            )
+        if (index.get("transformer_2") or [None])[0] is not None:
+            raise ValueError(
+                f"{self.root} samples with two transformers, one after the other; only "
+                "pipelines with one are supported"
+            )
+        transformer = _read_json(self.root / "transformer" / "config.json")
+        vae = _read_json(self.root / "vae" / "config.json")
+        self.expand_timesteps = bool(index.get("expand_timesteps", False))
+        self.patch_size = tuple(transformer["patch_size"])
+        self.spatial = int(vae["scale_factor_spatial"])
+        self.temporal = int(vae["scale_factor_temporal"])
+        self.scheduler_class = getattr(self._diffusers, index["scheduler"][1])
+        # The peaks were measured for one model: for another nothing is promised up front.
+        self.measured = _is_wan22_ti2v_5b(transformer, vae)
+        self._capability = tuple(self._torch.cuda.get_device_capability(self.device))
+        self._prompts: OrderedDict[tuple[str, str, int, str], Any] = OrderedDict()
+        self._text_dtype: str | None = None
+
+    # -----------------------------------------------------------------------------------------
+    # What a generation needs
+
+    def latent_shape(self, height: int, width: int, num_frames: int) -> tuple[int, int, int]:
+        """Frames, rows and columns of the latent video of a ``height`` x ``width`` video."""
+        _, p_h, p_w = self.patch_size
+        rows, columns = self.spatial * p_h, self.spatial * p_w
+        if height < rows or width < columns or height % rows or width % columns:
+            fit = (max(height // rows, 1) * rows, max(width // columns, 1) * columns)
+            raise ValueError(
+                f"{height} x {width} px does not divide into patches of {rows} x {columns} px: "
+                f"the nearest size below is {fit[0]} x {fit[1]}"
+            )
+        if num_frames < 1 or (num_frames - 1) % self.temporal:
+            fit = max((num_frames - 1) // self.temporal, 0) * self.temporal + 1
+            raise ValueError(
+                f"{num_frames} frames is not one frame plus groups of {self.temporal}: the "
+                f"nearest length below is {fit}"
+            )
+        frames = (num_frames - 1) // self.temporal + 1
+        return frames, height // self.spatial, width // self.spatial
+
+    def tokens(self, height: int, width: int, num_frames: int) -> int:
+        """Tokens the transformer attends over for a video of this size."""
+        frames, rows, columns = self.latent_shape(height, width, num_frames)
+        p_t, p_h, p_w = self.patch_size
+        return (frames // p_t) * (rows // p_h) * (columns // p_w)
+
+    def transformer_peak(self, tokens: int, *, slots: int, one_pass: bool = False) -> int | None:
+        """VRAM the process holds at the peak of the transformer stage, from measurements."""
+        if not self.measured or slots not in TRANSFORMER_BASE:
+            return None
+        per_token = TRANSFORMER_PER_TOKEN + (TRANSFORMER_ONE_PASS if one_pass else 0)
+        return TRANSFORMER_BASE[slots] + per_token * tokens
+
+    def check(
+        self, *, height: int, width: int, num_frames: int, one_pass: bool = False
+    ) -> dict[str, int]:
+        """Refuse now, with what would fit, a generation that is not expected to fit.
+
+        Every stage is checked against the VRAM that is free at this moment; each is checked
+        again, against what is free then, when it starts. Returns the expected peak of each
+        stage in bytes: empty for a model whose peaks were not measured.
+
+        What is compared with what: the expected peaks are what PyTorch's allocator reserved
+        in measured runs, plus the CUDA context of a process; the budget is the VRAM the
+        driver reports free after ``torch.cuda.empty_cache()``, plus what this process holds
+        (:meth:`~hypertier.diffusion.sequential.SequentialPipeline.available`), or the
+        caller's ``vram_budget`` if that is less. The F3 criterion (3.4 GB) is the peak of the
+        process as the driver counts it, which ``bench_video`` samples while a generation
+        runs: see :class:`~hypertier.adapters.hf_diffusers.VaeConfig`.
+
+        The peaks of the VAE were measured for videos of 17 to 121 frames. A length outside
+        that range is refused: nothing is extrapolated.
+        """
+        if not self.measured:
+            return {}
+        shortest, longest = self._vae_candidates()[0].measured_frames
+        if not shortest <= num_frames <= longest:
+            raise ValueError(
+                f"the VRAM this model needs was measured for videos of {shortest} to {longest} "
+                f"frames: {num_frames} frames is outside what can be checked, and is refused "
+                "instead of guessed"
+            )
+        available = self.available()
+
+        def fits(frames: int, slots: int) -> bool:
+            peak = self.transformer_peak(
+                self.tokens(height, width, frames), slots=slots, one_pass=one_pass
+            )
+            try:
+                self._vae_config(available, frames)
+            except ValueError:
+                return False
+            return peak is not None and self.fits(peak, available)
+
+        tokens = self.tokens(height, width, num_frames)
+        peak = self.transformer_peak(tokens, slots=self.slots, one_pass=one_pass)
+        advice = []
+        if not fits(num_frames, self.slots):
+            if self.slots > 1 and fits(num_frames, 1):
+                advice.append("slots=1 fits, at the price of copies that no longer overlap")
+            shorter = next(
+                (n for n in range(num_frames - self.temporal, shortest - 1, -self.temporal)
+                 if fits(n, self.slots)),
+                None,
+            )  # fmt: skip
+            if shorter is not None:
+                advice.append(f"{shorter} frames fit at {height} x {width}")
+            hint = "Try: " + "; or ".join(advice) if advice else "Nothing shorter fits either"
+            if peak is not None and not self.fits(peak, available):
+                name = f"transformer ({tokens} tokens, {self.slots} slots)"
+                raise ValueError(self.shortfall(name, peak, available, hint))
+            least = min(c.peak_bytes(num_frames) for c in self._vae_candidates())
+            raise ValueError(
+                self.shortfall(f"VAE ({num_frames} frames)", least, available, hint)
+            )
+        if not self.fits(TEXT_PEAK, available):
+            raise ValueError(self.shortfall("text", TEXT_PEAK, available))
+        chosen = self._vae_config(available, num_frames)
+        return {"text": TEXT_PEAK, "transformer": peak, "vae": chosen.peak_bytes(num_frames)}
+
+    # -----------------------------------------------------------------------------------------
+    # The stages
+
+    def encode(self, prompts: Sequence[str]) -> torch.Tensor:
+        """The embeddings of ``prompts`` as ``WanPipeline`` computes them: ``[n, 512, dim]``.
+
+        Each prompt is cleaned, cut or padded to 512 tokens, encoded with the bits it gets
+        alone, and zeroed after its last token. Prompts seen before come from memory; when
+        all of them do, the text encoder is not loaded at all.
+
+        Bytes moved: every block of the encoder from disk to VRAM once, whatever the number
+        of prompts; nothing when they are all cached.
+        """
+        torch = self._torch
+        cleaned = [self._clean(prompt) for prompt in prompts]
+        directory = self.root / "text_encoder"
+        if self._text_dtype is None:
+            dtype = skeleton.checkpoint_dtype(torch, SafetensorsIndex(directory))
+            self._text_dtype = str(dtype)
+        keys = [
+            (text, str(directory.resolve()), MAX_SEQUENCE_LENGTH, self._text_dtype)
+            for text in cleaned
+        ]
+        missing = list(dict.fromkeys(key for key in keys if key not in self._prompts))
+        if missing:
+            import transformers
+
+            tokenizer = transformers.AutoTokenizer.from_pretrained(self.root / "tokenizer")
+            batch = tokenizer(
+                [key[0] for key in missing],
+                padding="max_length",
+                max_length=MAX_SEQUENCE_LENGTH,
+                truncation=True,
+                add_special_tokens=True,
+                return_attention_mask=True,
+                return_tensors="pt",
+            )
+            used = batch.attention_mask.gt(0).sum(dim=1).tolist()
+            with self.stage("text", TEXT_PEAK if self.measured else None) as report:
+                started = time.perf_counter()
+                with load_text_encoder(directory, device=self.device) as encoder:
+                    report.load_seconds = time.perf_counter() - started
+                    with torch.no_grad():
+                        hidden = encoder.model(
+                            batch.input_ids.to(self.device), batch.attention_mask.to(self.device)
+                        ).last_hidden_state.cpu()
+                    report.details.update(prompts=len(missing), tokens=used)
+            for row, (key, length) in enumerate(zip(missing, used)):
+                embedding = hidden[row].clone()
+                embedding[length:] = 0  # as WanPipeline: the tokens of the prompt, then zeros
+                self._remember(key, embedding)
+        for key in keys:
+            self._prompts.move_to_end(key)
+        return torch.stack([self._prompts[key] for key in keys])
+
+    def denoise(
+        self,
+        prompt_embeds: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        *,
+        height: int,
+        width: int,
+        num_frames: int,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 5.0,
+        seed: int = 0,
+        one_pass: bool = False,
+    ) -> torch.Tensor:
+        """Sample the latents of one video; returns them on the CPU.
+
+        The loop is :func:`~hypertier.adapters.hf_diffusers.denoise` with the scheduler of
+        the pipeline and noise drawn on the CPU from ``seed``.
+        """
+        torch = self._torch
+        shape = self.latent_shape(height, width, num_frames)
+        tokens = self.tokens(height, width, num_frames)
+        guided = guidance_scale > 1.0
+        expected = self.transformer_peak(tokens, slots=self.slots, one_pass=one_pass and guided)
+        with self.stage("transformer", expected) as report:
+            started = time.perf_counter()
+            directory = self.root / "transformer"
+            with load_wan_transformer(directory, slots=self.slots, device=self.device) as streamed:
+                report.load_seconds = time.perf_counter() - started
+                latents = denoise(
+                    streamed.model,
+                    self.scheduler_class.from_pretrained(self.root / "scheduler"),
+                    prompt_embeds,
+                    negative_prompt_embeds,
+                    latent_shape=shape,
+                    expand_timesteps=self.expand_timesteps,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=guidance_scale,
+                    generator=torch.Generator("cpu").manual_seed(seed),
+                    one_pass=one_pass and guided,
+                ).cpu()
+                report.details.update(
+                    tokens=tokens,
+                    slots=self.slots,
+                    steps=num_inference_steps,
+                    weights_vram_bytes=streamed.vram_bytes,
+                    pinned_ram_bytes=streamed.ram_bytes,
+                    **_pass_summary(streamed.streamer.pass_stats()),
+                )
+        return latents
+
+    def decode(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode latents into ``uint8`` frames ``[frames, height, width, 3]`` in host RAM.
+
+        The configuration is the best one whose measured peak fits in the VRAM that is free
+        now, on this GPU: see :func:`~hypertier.adapters.hf_diffusers.choose_vae_config`.
+        """
+        num_frames = (latents.shape[2] - 1) * self.temporal + 1
+        config = self._vae_config(self.available(), num_frames)
+        expected = config.peak_bytes(num_frames) if self.measured else None
+        with self.stage("vae", expected) as report:
+            started = time.perf_counter()
+            with load_wan_vae(self.root / "vae", config, device=self.device) as vae:
+                report.load_seconds = time.perf_counter() - started
+                plan = vae.plan(*latents.shape[-2:])
+                frames = vae.decode(latents)
+                report.details.update(
+                    config=config.name,
+                    tiles=plan.count,
+                    tile_cells=list(plan.tile),
+                    min_psnr_db=config.min_psnr_db,
+                    weights_vram_bytes=vae.vram_bytes,
+                    pinned_ram_bytes=vae.ram_bytes,
+                )
+        return frames
+
+    def __call__(
+        self,
+        prompt: str,
+        negative_prompt: str = "",
+        *,
+        height: int = 704,
+        width: int = 1280,
+        num_frames: int = 49,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 5.0,
+        seed: int = 0,
+        one_pass: bool = False,
+    ) -> VideoResult:
+        """Generate one video from a prompt.
+
+        Args:
+            prompt: what to draw.
+            negative_prompt: what to steer away from. Used when ``guidance_scale`` is above 1.
+            height, width: of the video, in pixels: multiples of 32 for Wan 2.2 TI2V.
+            num_frames: one frame plus groups of four.
+            num_inference_steps: steps of the scheduler.
+            guidance_scale: scale of classifier-free guidance; 1 or less samples without it.
+            seed: of the initial noise, drawn on the CPU.
+            one_pass: both branches of the guidance in one pass over the weights. Same bits
+                as two passes; it only wins time with few tokens, and costs VRAM.
+
+        Bytes moved: the text encoder from disk once; every transformer block from RAM to
+        VRAM once per pass, two passes per guided step; the VAE's weights once.
+        """
+        first = len(self.reports)
+        self.latent_shape(height, width, num_frames)  # a size it cannot draw: refused now
+        self.check(height=height, width=width, num_frames=num_frames, one_pass=one_pass)
+        guided = guidance_scale > 1.0
+        embeds = self.encode([prompt, negative_prompt] if guided else [prompt])
+        latents = self.denoise(
+            embeds[:1],
+            embeds[1:] if guided else None,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            one_pass=one_pass,
+        )
+        frames = self.decode(latents)
+        stages = {report.name: report for report in self.reports[first:]}
+        return VideoResult(frames, latents, stages, stages["vae"].details["config"])
+
+    def close(self) -> None:
+        """Forget the cached prompts. No stage outlives the call that ran it."""
+        self._prompts.clear()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    # -----------------------------------------------------------------------------------------
+
+    def _clean(self, prompt: str) -> str:
+        from diffusers.pipelines.wan.pipeline_wan import prompt_clean
+        from diffusers.utils import is_ftfy_available
+
+        if not is_ftfy_available():
+            raise RuntimeError(
+                "WanPipeline cleans prompts with ftfy, and without it the same prompt gives "
+                "other tokens: pip install hypertier[diffusers]"
+            )
+        return prompt_clean(prompt)
+
+    def _remember(self, key: tuple[str, str, int, str], embedding: Any) -> None:
+        self._prompts[key] = embedding
+        while len(self._prompts) > CACHED_PROMPTS:
+            self._prompts.popitem(last=False)
+
+    def _vae_candidates(self) -> tuple[VaeConfig, ...]:
+        """What the VAE stage may run in: the caller's choice, or what this GPU can run."""
+        if self.vae_config is not None:
+            return (self.vae_config,)
+        return usable_vae_configs(VAE_CONFIGS, self._capability)
+
+    def _vae_config(self, available: int, num_frames: int) -> VaeConfig:
+        candidates = self._vae_candidates()
+        if not self.measured and candidates:
+            return candidates[0]  # no peaks to choose by: the best one, unchecked
+        return choose_vae_config(
+            available, num_frames, margin=self.margin, capability=self._capability,
+            configs=candidates,
+        )  # fmt: skip
+
+
+def load_wan_pipeline(
+    model_dir: str | PathLike[str],
+    *,
+    slots: int = 2,
+    vae_config: VaeConfig | str | None = None,
+    vram_budget: int | None = None,
+    margin: int = VRAM_MARGIN,
+    device: torch.device | str = "cuda",
+) -> WanVideoPipeline:
+    """Open a local ``WanPipeline`` directory to generate video a stage at a time.
+
+    Args:
+        model_dir: a ``diffusers`` pipeline directory (``model_index.json`` and one directory
+            per component). Nothing is downloaded, and nothing is loaded yet.
+        slots: VRAM buffers the transformer's blocks are streamed through.
+        vae_config: how the VAE decodes: a
+            :class:`~hypertier.adapters.hf_diffusers.VaeConfig` or the name of one. None
+            takes the best one that this GPU can run and that fits when the stage starts.
+        vram_budget: VRAM the process may hold, in bytes, as the driver counts it. None: what
+            is free when each stage starts, measured after the previous stage is released
+            and the allocator's cache emptied.
+        margin: bytes to leave free above the expected peak of a stage.
+        device: the CUDA device every stage computes on.
+
+    Call the result with a prompt, or call its stages one by one (``encode``, ``denoise``,
+    ``decode``). Each call loads a stage, runs it and releases it: nothing stays in VRAM or
+    in page-locked RAM between calls, and the transformer is read again every time (14-17 s
+    for the 5B model).
+    """
+    return WanVideoPipeline(
+        model_dir,
+        slots=slots,
+        vae_config=vae_config,
+        vram_budget=vram_budget,
+        margin=margin,
+        device=device,
+    )
+
+
+# ---------------------------------------------------------------------------------------------
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except FileNotFoundError:
+        raise ValueError(f"{path} is missing: this needs a diffusers pipeline directory") from None
+
+
+def _is_wan22_ti2v_5b(transformer: dict[str, Any], vae: dict[str, Any]) -> bool:
+    """Whether the measured peaks are of this model: Wan 2.2 TI2V-5B and its VAE."""
+    width = transformer.get("num_attention_heads", 0) * transformer.get("attention_head_dim", 0)
+    return (
+        width == 3072
+        and transformer.get("num_layers") == 30
+        and transformer.get("in_channels") == 48
+        and vae.get("scale_factor_spatial") == 16
+        and vae.get("z_dim") == 48
+    )
+
+
+def _pass_summary(stats: Sequence[Any]) -> dict[str, Any]:
+    """What the passes of the transformer cost, in a few numbers."""
+    if not stats:
+        return {"passes": 0}
+    hidden = [s.efficiency for s in stats if s.efficiency is not None]
+    return {
+        "passes": len(stats),
+        "seconds_per_pass": median(s.total_ms for s in stats) / 1e3,
+        "copy_seconds_per_pass": median(s.copy_ms for s in stats) / 1e3,
+        "stall_seconds": sum(s.stall_ms for s in stats) / 1e3,
+        "overlap_efficiency_min": min(hidden) if hidden else None,
+        "overlap_efficiency_median": median(hidden) if hidden else None,
+    }
+
+
+__all__ = [
+    "MAX_SEQUENCE_LENGTH",
+    "VideoResult",
+    "WanVideoPipeline",
+    "load_wan_pipeline",
+]
