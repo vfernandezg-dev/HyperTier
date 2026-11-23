@@ -371,6 +371,30 @@ def fastvideo_loop(model, cond, steps, generator):
     of its flow-matching scheduler (github.com/hao-ai-lab/FastVideo, Apache-2.0), around a
     ``WanTransformer3DModel`` of ``diffusers``: latents as ``[batch, frames, channels, height,
     width]``, every frame a row with a sigma of its own looked up in the table.
+
+    The sources, at commit ``a7eb3401de33d61530c09bcdb6ced12de322b719``, to read this function
+    against line by line. The loop, ``DmdDenoisingStage.forward``:
+
+        https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/pipelines/basic/wan/stages/dmd.py#L95-L168
+
+    The clean video from the prediction, ``pred_noise_to_pred_video``:
+
+        https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/models/utils.py#L170-L208
+
+    The table of sigmas and timesteps, and ``add_noise``, of ``FlowMatchEulerDiscreteScheduler``:
+
+        https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/models/schedulers/scheduling_flow_match_euler_discrete.py#L141-L157
+        https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/models/schedulers/scheduling_flow_match_euler_discrete.py#L601-L635
+
+    The shift of that table in this stage, ``DMD_TRAINING_NOISE_SHIFT`` = 8.0, and the
+    timesteps of FastWan 2.2 TI2V-5B, 1000, 757 and 522:
+
+        https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/pipelines/basic/wan/wan_dmd_pipeline.py#L61
+        https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/models/wan/definition.py#L16
+        https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/models/wan/pipeline_config.py#L278-L280
+
+    What is not theirs here: the transformer, which is the one of ``diffusers`` called through
+    ``run``, without their autocast, attention backends or image conditioning.
     """
     import numpy as np
     import torch

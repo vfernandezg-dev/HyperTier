@@ -7,6 +7,22 @@ This product is licensed under the Apache License, Version 2.0.
 See the LICENSE file for details.
 
 The few-step sampler (denoise_dmd in src/hypertier/adapters/hf_diffusers.py, and the loop its
-tests compare it with) follows the DMD sampling loop of FastVideo
-(https://github.com/hao-ai-lab/FastVideo), which is licensed under the Apache License,
-Version 2.0.
+tests compare it with, fastvideo_loop in tests/test_adapters_diffusers.py) follows the DMD
+sampling loop of FastVideo (https://github.com/hao-ai-lab/FastVideo), which is licensed under
+the Apache License, Version 2.0. It was written from these sources of FastVideo, at commit
+a7eb3401de33d61530c09bcdb6ced12de322b719:
+
+  The loop (DmdDenoisingStage.forward):
+  https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/pipelines/basic/wan/stages/dmd.py#L95-L168
+
+  The clean video from the prediction (pred_noise_to_pred_video):
+  https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/models/utils.py#L170-L208
+
+  The table of sigmas and timesteps, and add_noise (FlowMatchEulerDiscreteScheduler):
+  https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/models/schedulers/scheduling_flow_match_euler_discrete.py#L141-L157
+  https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/models/schedulers/scheduling_flow_match_euler_discrete.py#L601-L635
+
+  The shift of that table (DMD_TRAINING_NOISE_SHIFT) and the timesteps of FastWan 2.2 TI2V-5B:
+  https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/pipelines/basic/wan/wan_dmd_pipeline.py#L61
+  https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/models/wan/definition.py#L16
+  https://github.com/hao-ai-lab/FastVideo/blob/a7eb3401de33d61530c09bcdb6ced12de322b719/fastvideo/models/wan/pipeline_config.py#L278-L280
