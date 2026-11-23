@@ -86,16 +86,17 @@ class VaeConfig:
     **What a peak is, and what it is compared with.** A peak is the most memory PyTorch's
     allocator *reserved* during a decode run in a process of its own
     (``torch.cuda.max_memory_reserved``), plus
-    :data:`~hypertier.diffusion.sequential.CUDA_CONTEXT` for what a process holds outside the
-    allocator. It is compared with a budget made the same way: the VRAM the driver reports
-    free after ``torch.cuda.empty_cache()``, plus what the process holds at that moment (see
+    :data:`~hypertier.diffusion.sequential.CUDA_CONTEXT`: the most a process was measured to
+    hold outside the allocator. It is compared with a budget made the same way: the VRAM the
+    driver reports free after ``torch.cuda.empty_cache()``, plus what the process holds at
+    that moment, read from the driver (see
     :meth:`~hypertier.diffusion.sequential.SequentialPipeline.available`).
 
     The 3.4 GB of the F3 criterion is another figure, measured another way: the most VRAM the
     whole process holds *as the driver counts it*, sampled from the driver while a generation
-    runs, less what was in use before the process started. ``bench_video`` measures it. The
-    two agree within the difference between a real CUDA context (111 to 143 MiB measured) and
-    the 143 MiB assumed here.
+    runs, less what was in use before the process started. ``bench_video`` measures it. It
+    comes out below the peak counted here by what the real context is short of
+    :data:`~hypertier.diffusion.sequential.CUDA_CONTEXT`.
     """
 
     name: str

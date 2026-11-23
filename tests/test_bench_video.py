@@ -115,6 +115,8 @@ def test_the_summary_shows_every_stage_and_every_check(bench):
             "vae": _stage(128.0, 2760, 2815, config="bf16-resident", tiles=16),
         },
     }  # fmt: skip
+    generated["stages"]["vae"].update(context_bytes=141 * MiB, context_measured=True)
+    generated["stages"]["text"].update(context_bytes=210 * MiB, context_measured=False)
     results = {
         "generate": generated,
         "checks": {"within_vram_budget": True, "latents_equal_strict_baseline": True,
@@ -126,7 +128,9 @@ def test_the_summary_shows_every_stage_and_every_check(bench):
     assert "GPU at 63 °C at the start, 76 °C at the end" in text
     for line in ("text", "transformer", "vae"):
         assert f"\n  {line}" in text
-    assert "peak  2500 MiB (expected 2600)" in text
+    assert "peak  2500 MiB (expected 2600)\n" in text
+    assert "peak  2760 MiB (expected 2815), 141 outside the allocator" in text
+    assert "peak  1200 MiB (expected 1300)\n" in text, "not read from the driver: not shown"
     assert "copies 1.48 s, overlap efficiency 1.00 (lowest 0.97)" in text
     assert "bf16-resident, 16 tiles" in text
     assert "2900 MiB (3.04 GB) of a budget of 3.4 GB" in text

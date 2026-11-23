@@ -15,8 +15,24 @@ be in VRAM, or in page-locked RAM, at the same time. :class:`SequentialPipeline`
   fails at once, with what would fit, instead of running out of memory minutes later.
 * Afterwards the time and the peaks of the stage are on record.
 
-All VRAM figures are what the process holds as the driver counts it, its CUDA context
-included: that is what ``nvidia-smi`` shows and what a budget of "3.4 GB" means.
+All VRAM figures are what the process holds as the driver counts it: that is what
+``nvidia-smi`` shows and what a budget of "3.4 GB" means. A process holds more than PyTorch's
+allocator: its CUDA context, which **grows while a stage runs**. CUDA loads every kernel the
+first time it is used, so each new kind of operation, dtype and algorithm adds a little, and
+the first stage adds most. Measured on the reference laptop (driver 595), in MiB outside the
+allocator at the peak of each stage of one generation::
+
+                                               start   text   transformer   VAE
+    a process as a user runs it                   77    123           155   141
+    as bench_video runs its workers               77    153           209   195
+
+``bench_video`` sets ``CUBLAS_WORKSPACE_CONFIG=:4096:8`` and warms the GPU up with a matmul in
+float16: cuBLAS then keeps a larger workspace of its own, and more kernels are loaded. The
+transformer stage holds 16 to 18 MiB more while it runs than after it: page-locked RAM costs
+2 MiB of VRAM per GiB for as long as it is registered with the driver. A small matmul, a
+small convolution and a small attention before the first stage load 20 MiB of all that, and
+the text stage still adds 28 MiB after them: the context cannot be warmed up to its final
+size cheaply, so its growth is budgeted for instead (:data:`CUDA_CONTEXT`).
 
 Importing this module does not import PyTorch.
 """
@@ -31,15 +47,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from hypertier.telemetry._common import MiB, format_bytes, require_cuda, resolve_device
+from hypertier.telemetry.vram import process_vram
 
 VRAM_MARGIN = 300 * MiB
 """VRAM left free above the expected peak of a stage. The peaks are measurements on one
 machine, and a desktop may take some VRAM at any time."""
 
-CUDA_CONTEXT = 143 * MiB
-"""What a process holds in VRAM outside PyTorch's allocator: its CUDA context and the
-libraries loaded into it. 111 to 143 MiB measured on the reference laptop (driver 595),
-depending on the stage; the largest is taken, so that peaks are not understated."""
+CUDA_CONTEXT = 210 * MiB
+"""VRAM a process holds outside PyTorch's allocator, at the most: what the peak of a stage is
+counted with. The most measured on the reference laptop is 209 MiB (see the module
+docstring). What a process holds now is read from the driver; this number is for what cannot
+be read: how far the context will have grown at the peak of a stage that has not run yet,
+and what the process holds when the driver does not say (WSL2)."""
 
 
 @dataclass
@@ -56,7 +75,12 @@ class StageReport:
         seconds: wall time of the stage, loading and releasing included.
         peak_allocated_bytes: most VRAM in live tensors.
         peak_reserved_bytes: most VRAM held by PyTorch's allocator.
-        peak_process_bytes: ``peak_reserved_bytes`` plus :data:`CUDA_CONTEXT`.
+        context_bytes: VRAM the process held outside the allocator, read while the stage was
+            still loaded: what the driver attributes to the process, less what the allocator
+            held at that moment. :data:`CUDA_CONTEXT` when the driver does not say.
+        context_measured: whether ``context_bytes`` was read from the driver.
+        peak_process_bytes: ``peak_reserved_bytes`` plus ``context_bytes``: the most VRAM the
+            process held, as the driver counts it.
         details: whatever else the stage wants on record.
     """
 
@@ -68,6 +92,8 @@ class StageReport:
     seconds: float = 0.0
     peak_allocated_bytes: int = 0
     peak_reserved_bytes: int = 0
+    context_bytes: int | None = None
+    context_measured: bool = False
     peak_process_bytes: int = 0
     details: dict[str, Any] = field(default_factory=dict)
 
@@ -109,16 +135,51 @@ class SequentialPipeline:
         self._torch.cuda.empty_cache()
         return int(self._torch.cuda.mem_get_info(self.device)[0])
 
+    def context(self) -> int | None:
+        """VRAM this process holds outside PyTorch's allocator now; None if it is not known.
+
+        What the driver attributes to the process
+        (:func:`~hypertier.telemetry.vram.process_vram`), less what the allocator holds.
+        """
+        # A process is in the driver's list once it has a context on the device: asking for
+        # the free VRAM creates it, if nothing has yet.
+        self._torch.cuda.mem_get_info(self.device)
+        held = process_vram(self.device)
+        if held is None:
+            return None
+        return max(held - int(self._torch.cuda.memory_reserved(self.device)), 0)
+
     def available(self) -> int:
         """VRAM the process may hold from now on, its CUDA context included.
 
         What is free plus what the process already holds, or the caller's budget if that is
         less. Other processes may take VRAM later: that is what the margin is for.
+
+        Expected peaks are counted with :data:`CUDA_CONTEXT`, as large as a context was seen
+        to grow. A context that is smaller now will grow during the stage, out of the VRAM
+        that is free: so the context counts as already held only for what it holds now, and
+        never for more than the peaks count. Before the first stage that is 70 MiB of 210.
+        Whatever it holds above :data:`CUDA_CONTEXT`, the peaks do not know of: that comes
+        off the budget.
         """
         free = self.free_vram()
-        held = int(self._torch.cuda.memory_reserved(self.device)) + CUDA_CONTEXT
-        mine = free + held
-        return mine if self.vram_budget is None else min(mine, self.vram_budget)
+        context = self.context()
+        if context is None:  # the driver does not say: as much as the peaks count
+            context = CUDA_CONTEXT
+        counted, beyond = min(context, CUDA_CONTEXT), max(context - CUDA_CONTEXT, 0)
+        mine = free + int(self._torch.cuda.memory_reserved(self.device)) + counted
+        return mine if self.vram_budget is None else min(mine, self.vram_budget - beyond)
+
+    def read_context(self, report: StageReport) -> None:
+        """Put on ``report`` what the process holds outside the allocator at this moment.
+
+        For a stage to call while its model is still loaded: page-locked RAM costs VRAM for
+        as long as it is registered, and that is gone once the stage has released it. A
+        stage that does not call it is read when it ends.
+        """
+        context = self.context()
+        report.context_measured = context is not None
+        report.context_bytes = CUDA_CONTEXT if context is None else context
 
     def fits(self, expected_peak: int, available: int) -> bool:
         return expected_peak + self.margin <= available
@@ -157,7 +218,9 @@ class SequentialPipeline:
             report.seconds = time.perf_counter() - started
             report.peak_allocated_bytes = int(torch.cuda.max_memory_allocated(self.device))
             report.peak_reserved_bytes = int(torch.cuda.max_memory_reserved(self.device))
-            report.peak_process_bytes = report.peak_reserved_bytes + CUDA_CONTEXT
+            if report.context_bytes is None:
+                self.read_context(report)
+            report.peak_process_bytes = report.peak_reserved_bytes + report.context_bytes
             self.reports.append(report)
 
     def shortfall(self, name: str, expected_peak: int, available: int, advice: str = "") -> str:
