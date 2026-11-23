@@ -35,6 +35,13 @@ CHANNELS = 16
 TEXT_DIM = 32
 KEPT_IN_FP32 = {"rope", "time_embedder", "scale_shift_table", "norm1", "norm2", "norm3"}
 
+CHUNKED_OVER_NOISE = 1.5
+"""How far a chunked feed-forward network may move one pass, in units of the rounding noise
+of that pass: its distance to the same pass run in the next wider dtype. Chunking changes
+which kernel rounds, so its error has to be of the size of rounding, not a number picked by
+hand. Measured on Wan 2.2 TI2V-5B at 1,950 tokens: a bfloat16 pass is 1.1-1.9 % from float32,
+and chunking moves it by 0.43-0.74 of that."""
+
 
 @pytest.fixture
 def diffusers():
@@ -104,6 +111,12 @@ def one_by_one(model, latent, timestep, text):
 
     rows = range(latent.shape[0])
     return torch.cat([run(model, latent[i : i + 1], timestep[i : i + 1], text[i : i + 1]) for i in rows])
+
+
+def relative_error(got, expected):
+    """Root mean square of the difference, over that of ``expected``."""
+    got, expected = got.double().cpu(), expected.double().cpu()
+    return float((got - expected).pow(2).mean().sqrt() / expected.pow(2).mean().sqrt())
 
 
 def make_scheduler(diffusers, kind):
@@ -220,25 +233,36 @@ def test_one_row_of_the_time_embedding_is_kept_when_the_tokens_share_a_timestep(
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize(("dtype", "bound"), [("bfloat16", 2e-2), ("float32", 1e-5)])
-def test_a_chunked_ffn_is_judged_by_the_error_of_one_pass(diffusers, disk_tmp, dtype, bound):
-    """Not exact, and not asked to be: the same values up to the rounding of other kernels."""
+@pytest.mark.parametrize(
+    ("dtype", "wider"),
+    [("bfloat16", "float32"), ("float16", "float32"), ("float32", "float64")],
+)
+def test_a_chunked_ffn_is_judged_by_the_error_of_one_pass(diffusers, disk_tmp, dtype, wider):
+    """Not exact, and not asked to be: its error is measured against the rounding of the pass."""
     import torch
 
     tiny_wan_transformer(disk_tmp)
-    want = reference(disk_tmp, dtype)
     latent, text = inputs(dtype)
+    timestep = per_token(757.0)
     calls = []
-    with load_wan_transformer(disk_tmp, dtype=dtype, ffn_chunk=20) as ours, torch.no_grad():
-        inner = ours.model.blocks[0].ffn.net[0]
-        spy = inner.register_forward_pre_hook(lambda module, args: calls.append(args[0].shape[1]))
-        got = run(ours.model, latent, per_token(757.0), text).float()
-        spy.remove()
-        expected = run(want, latent, per_token(757.0), text).float()
-    error = float((got - expected).pow(2).mean().sqrt() / expected.pow(2).mean().sqrt())
-    print(f"\n[wan] ffn in chunks of 20 of {TOKENS} tokens, {dtype}: relative error {error:.2e}")
+    with torch.no_grad():
+        whole = run(reference(disk_tmp, dtype), latent, timestep, text)
+        wide = getattr(torch, wider)
+        exact = run(reference(disk_tmp, wider), latent.to(wide), timestep, text.to(wide))
+        with load_wan_transformer(disk_tmp, dtype=dtype, ffn_chunk=20) as ours:
+            inner = ours.model.blocks[0].ffn.net[0]
+            spy = inner.register_forward_pre_hook(
+                lambda module, args: calls.append(args[0].shape[1])
+            )
+            chunked = run(ours.model, latent, timestep, text)
+            spy.remove()
+    noise, error = relative_error(whole, exact), relative_error(chunked, whole)
+    print(
+        f"\n[wan] {dtype}: one pass is {noise:.2e} from {wider}; the ffn in chunks of 20 of "
+        f"{TOKENS} tokens moves it {error:.2e}, {error / noise:.2f} of that"
+    )
     assert calls == [20, 20, 8]
-    assert error < bound
+    assert error <= CHUNKED_OVER_NOISE * noise
 
 
 # ---------------------------------------------------------------------------------------------
@@ -521,8 +545,33 @@ def real_expected(real_dir):
     return expected
 
 
+def real_pass():
+    """The inputs of one pass at 1,950 tokens, already rounded to bfloat16."""
+    import torch
+
+    latent = torch.randn(1, 48, *SMALL, generator=torch.Generator().manual_seed(1))
+    timestep = per_token(757.0)[:, :1].expand(1, 1950)
+    return latent.to("cuda", torch.bfloat16), timestep, real_embeds(3, 60)[:1]
+
+
 @pytest.fixture(scope="module")
-def real_wan(real_dir, real_expected):
+def real_pass_in_float32(real_dir, real_expected):
+    """That pass with the model run in float32, which fits at this size: what bfloat16 rounds.
+
+    18.3 GiB of page-locked RAM, so it is released before the bfloat16 model is loaded.
+    """
+    import torch
+
+    latent, timestep, text = real_pass()
+    with load_wan_transformer(real_dir / "transformer", dtype="float32") as wide, torch.no_grad():
+        exact = run(wide.model, latent.float(), timestep, text.float()).cpu()
+    gc.collect()
+    torch.cuda.empty_cache()
+    return exact
+
+
+@pytest.fixture(scope="module")
+def real_wan(real_dir, real_expected, real_pass_in_float32):
     with load_wan_transformer(real_dir / "transformer") as ours:
         yield ours
 
@@ -575,23 +624,26 @@ def test_the_real_model_at_full_size_gives_the_latents_of_the_strict_baseline(
 
 @pytest.mark.slow
 @pytest.mark.cuda
-def test_the_real_chunked_ffn_stays_within_the_rounding_of_one_pass(real_wan):
-    """Measured: 1.5 % at 1,950 tokens and 0.8 % at 12,090, whatever the chunk. Twice that."""
+def test_the_real_chunked_ffn_stays_within_the_rounding_of_one_pass(
+    real_wan, real_pass_in_float32
+):
     import torch
 
     model = real_wan.model
-    latent = torch.randn(1, 48, *SMALL, generator=torch.Generator().manual_seed(1))
-    arguments = (latent.to("cuda", torch.bfloat16), per_token(757.0)[:, :1].expand(1, 1950))
-    text = real_embeds(3, 60)[:1]
+    arguments = real_pass()
     with torch.no_grad():
-        whole = run(model, *arguments, text).float()
+        whole = run(model, *arguments).cpu()
         undo = [chunk_tokens(block.ffn, 512) for block in model.blocks]
         try:
-            chunked = run(model, *arguments, text).float()
+            chunked = run(model, *arguments).cpu()
         finally:
             for restore in undo:
                 restore()
-        assert torch.equal(run(model, *arguments, text).float(), whole), "undone: exact again"
-    error = float((chunked - whole).pow(2).mean().sqrt() / whole.pow(2).mean().sqrt())
-    print(f"\n[wan] ffn in chunks of 512 of 1950 tokens: relative error of one pass {error:.2e}")
-    assert error < 0.03
+        assert torch.equal(run(model, *arguments).cpu(), whole), "undone: exact again"
+    noise = relative_error(whole, real_pass_in_float32)
+    error = relative_error(chunked, whole)
+    print(
+        f"\n[wan] 1950 tokens: one bfloat16 pass is {noise:.2e} from float32; the ffn in "
+        f"chunks of 512 moves it {error:.2e}, {error / noise:.2f} of that"
+    )
+    assert error <= CHUNKED_OVER_NOISE * noise

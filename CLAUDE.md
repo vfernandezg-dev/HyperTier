@@ -176,8 +176,9 @@ Create modules only when the current phase needs them.
    of PSNR after 16 steps with the timestep collapsed to one per sample; the same scene with
    other details. So equivalence means equal bits, and a threshold at the end of sampling
    says nothing. What cannot be exact (the FFN in token chunks, a real batch) is judged by the
-   error of **one** pass against the reference: 0.8-1.5 % measured on Wan 2.2 TI2V-5B with the
-   FFN chunked.
+   error of **one** pass, in units of the rounding noise of that pass: its distance to the
+   same pass run in float32. On Wan 2.2 TI2V-5B at 1,950 tokens a bf16 pass is 1.1-1.9 % from
+   float32, and chunking the FFN moves it by 0.43-0.74 of that; the tests allow 1.5.
    The Wan adapter (`load_wan_transformer`, `denoise`) equals `WanPipeline` by doing what
    `diffusers` does. Modules in `_keep_in_fp32_modules` stay in float32. The time embedding is
    computed per token, and one row is kept after the embedder when every token has the same
