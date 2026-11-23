@@ -59,7 +59,13 @@ packages = ["src/hypertier"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["cuda: needs a CUDA GPU; skipped automatically when none is available"]
+markers = [
+    "cuda: needs a CUDA GPU; skipped automatically when none is available",
+    "slow: runs on real checkpoints (HYPERTIER_MODELS) and takes minutes; run with -m slow",
+]
+# The slow tests are left out unless asked for: pytest -m slow runs them alone, and
+# pytest -m "slow or not slow" runs everything.
+addopts = "-m 'not slow'"
 
 [tool.ruff]
 line-length = 100

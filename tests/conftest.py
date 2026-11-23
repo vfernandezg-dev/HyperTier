@@ -80,7 +80,10 @@ def disk_tmp(request, tmp_path):
 
 @pytest.fixture
 def models_dir() -> Path:
-    """Directory of real checkpoints (``HYPERTIER_MODELS``); tests that need it skip without."""
+    """Directory of real checkpoints (``HYPERTIER_MODELS``); tests that need it skip without.
+
+    Such tests are marked ``slow``, which leaves them out of a plain ``pytest``.
+    """
     root = os.environ.get("HYPERTIER_MODELS")
     if not root or not Path(root).is_dir():
         pytest.skip("set HYPERTIER_MODELS to a directory of downloaded models")

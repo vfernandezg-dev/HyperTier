@@ -11,8 +11,9 @@ Everything exact is compared bit for bit. In bfloat16 a sampler turns a differen
 unit in the last place into another video, so a tolerance at the end of the loop would accept
 a wrong loop; what cannot be exact is judged by the error of one pass.
 
-With ``HYPERTIER_MODELS`` the same is checked on Wan 2.2 TI2V-5B (about four minutes): against
-``WanPipeline`` at a size it can run on 4 GB, and against the strict baseline at full size.
+With ``HYPERTIER_MODELS`` and ``-m slow`` the same is checked on Wan 2.2 TI2V-5B (about five
+minutes): against ``WanPipeline`` at a size it can run on 4 GB, and against the strict baseline
+at full size.
 """
 
 import gc
@@ -526,6 +527,7 @@ def real_wan(real_dir, real_expected):
         yield ours
 
 
+@pytest.mark.slow
 @pytest.mark.cuda
 def test_the_real_model_samples_the_latents_of_wanpipeline(real_dir, real_expected, real_wan):
     import diffusers
@@ -546,6 +548,7 @@ def test_the_real_model_samples_the_latents_of_wanpipeline(real_dir, real_expect
             assert torch.equal(got.cpu(), expected), (seed, prompt_tokens, guidance, one_pass)
 
 
+@pytest.mark.slow
 @pytest.mark.cuda
 def test_the_real_model_at_full_size_gives_the_latents_of_the_strict_baseline(
     real_dir, real_expected, real_wan
@@ -570,6 +573,7 @@ def test_the_real_model_at_full_size_gives_the_latents_of_the_strict_baseline(
         assert torch.equal(got.cpu(), real_expected[name]), name
 
 
+@pytest.mark.slow
 @pytest.mark.cuda
 def test_the_real_chunked_ffn_stays_within_the_rounding_of_one_pass(real_wan):
     """Measured: 1.5 % at 1,950 tokens and 0.8 % at 12,090, whatever the chunk. Twice that."""
