@@ -165,6 +165,10 @@ decode, over the first 9 frames of five videos at 720p x 49 and five at 480p x 1
 The length of the video moves the peak by 4 % at most, and not in proportion: a tile's
 activations decide it, and they do not depend on the length.
 
+Those videos were sampled in 20 steps of the model. The same ten, and two at 720p x 121,
+sampled in three steps by FastWan decode 3.0 to 3.7 dB above the lowest of each row:
+45.4 - 54.2, 42.7 - 52.7, 41.5 - 51.4 and 41.8 - 52.2 dB. The thresholds hold for both.
+
 The PSNR follows the picture far more than the configuration: 15 dB between a blurred
 background and a street of neon signs. Then the tile: with the same tiles float32 is 0.3 to
 0.8 dB above bfloat16, while tiles of 340 cells instead of 256 are 1.2 to 2.7 dB above. So
