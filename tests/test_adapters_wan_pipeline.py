@@ -265,7 +265,8 @@ def test_a_generation_that_does_not_fit_is_refused_with_what_would(measured):
     measured.set_available(one + VRAM_MARGIN - 1)
     with pytest.raises(ValueError) as refused:
         measured.check(**size)
-    assert "slots=1" not in str(refused.value) and "frames fit" in str(refused.value)
+    assert "slots=1 fits" not in str(refused.value) and "frames fit" in str(refused.value)
+    assert f"ffn_chunk={wan.FFN_CHUNK} fits, with latents that differ" in str(refused.value)
 
     measured.set_available(900 * MiB)
     with pytest.raises(ValueError, match="Nothing shorter fits either"):
@@ -274,6 +275,103 @@ def test_a_generation_that_does_not_fit_is_refused_with_what_would(measured):
     measured.slots = 1
     measured.set_available(one + VRAM_MARGIN)
     assert measured.check(**size)["transformer"] == one
+
+
+@pytest.mark.cuda
+def test_the_peak_of_the_transformer_is_read_between_what_was_measured(measured):
+    def expected(mib):
+        return mib * MiB + CUDA_CONTEXT
+
+    for (slots, way), points in wan.TRANSFORMER_PEAKS.items():
+        chunk = wan.FFN_CHUNK if way == "chunked" else None
+
+        def peak(tokens, slots=slots, way=way, chunk=chunk):
+            return measured.transformer_peak(
+                tokens, slots=slots, one_pass=way == "one pass", ffn_chunk=chunk
+            )
+
+        assert [tokens for tokens, _ in points] == sorted({tokens for tokens, _ in points})
+        points = [point for point in points if chunk is None or point[0] > chunk]
+        for tokens, mib in points:
+            assert peak(tokens) == expected(mib), (slots, way, tokens)
+        (fewer, low), (more, high) = points[:2]
+        assert peak((fewer + more) // 2) == pytest.approx(expected((low + high) / 2), abs=MiB)
+        most = points[-1][0]
+        message = f"measured up to {most} tokens: {most + 880} tokens is outside"
+        with pytest.raises(ValueError, match=message):
+            peak(most + 880)
+
+    whole = measured.transformer_peak(12_090, slots=2)
+    assert measured.transformer_peak(500, slots=2) == measured.transformer_peak(1_950, slots=2)
+    assert measured.transformer_peak(12_090, slots=2, ffn_chunk=wan.FFN_CHUNK) < whole
+    assert measured.transformer_peak(12_090, slots=2, ffn_chunk=12_090) == whole, "one chunk"
+    assert measured.transformer_peak(12_090, slots=2, ffn_chunk=64) < whole, "smaller chunks"
+    with pytest.raises(ValueError, match="was not measured with 3 slots: it is refused"):
+        measured.transformer_peak(12_090, slots=3)
+    with pytest.raises(ValueError, match="not measured with 2 slots, both branches .* at a time"):
+        measured.transformer_peak(12_090, slots=2, one_pass=True, ffn_chunk=wan.FFN_CHUNK)
+    with pytest.raises(ValueError, match=f"networks {wan.FFN_CHUNK + 1} tokens at a time"):
+        measured.transformer_peak(12_090, slots=2, ffn_chunk=wan.FFN_CHUNK + 1)
+    measured.measured = False
+    assert measured.transformer_peak(10**6, slots=7) is None, "another model: nothing is known"
+
+
+@pytest.mark.cuda
+def test_a_video_of_more_tokens_than_were_measured_is_refused_not_guessed(measured):
+    import torch
+
+    size = {"height": 704, "width": 1280, "num_frames": 121}  # 27,280 tokens
+    most = wan.TRANSFORMER_PEAKS[(2, "whole")][-1][0]
+    assert most < 27_280 == wan.TRANSFORMER_PEAKS[(2, "chunked")][-1][0]
+    measured.set_available(1 << 40)
+    with pytest.raises(ValueError) as refused:
+        measured(PROMPT, **size)
+    message = str(refused.value)
+    assert f"with 2 slots was measured up to {most} tokens: 27280 tokens is outside" in message
+    assert f"ffn_chunk={wan.FFN_CHUNK} fits, with latents that differ by rounding" in message
+    shorter = int(message.split(" frames fit at 704 x 1280")[0].rsplit(" ", 1)[1])
+    assert measured.tokens(704, 1280, shorter) <= most < measured.tokens(704, 1280, shorter + 4)
+    with pytest.raises(ValueError, match=f"measured up to {most} tokens"):
+        measured.denoise(torch.zeros(1, 512, 64), **size, guidance_scale=1.0)
+    assert not measured.reports, "refused before any stage ran"
+
+    measured.ffn_chunk = wan.FFN_CHUNK
+    chunked = measured.transformer_peak(27_280, slots=2, ffn_chunk=wan.FFN_CHUNK)
+    assert measured.check(**size)["transformer"] == chunked
+    measured.set_available(chunked + VRAM_MARGIN - 1)
+    with pytest.raises(ValueError) as refused:
+        measured.check(**size)
+    message = str(refused.value)
+    assert "(27280 tokens, 2 slots, the feed-forward networks 2048 tokens at a time)" in message
+    assert "slots=1 fits" in message and "ffn_chunk" not in message.split("Try:")[1]
+
+
+@pytest.mark.cuda
+def test_the_feed_forward_networks_can_run_in_chunks(diffusers, disk_tmp, monkeypatch):
+    import torch
+
+    tiny_wan_pipeline(disk_tmp)
+    asked = []
+    load = wan.load_wan_transformer
+
+    def spy(*args, **kwargs):
+        asked.append(kwargs["ffn_chunk"])
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(wan, "load_wan_transformer", spy)
+    run = {**SIZE, "num_inference_steps": 3}
+    with load_wan_pipeline(disk_tmp, vae_config=WHOLE) as whole:
+        expected = whole(PROMPT, NEGATIVE, **run).latents
+    with load_wan_pipeline(disk_tmp, vae_config=WHOLE, ffn_chunk=45) as one_chunk:
+        assert torch.equal(one_chunk(PROMPT, NEGATIVE, **run).latents, expected), "45 tokens"
+    with load_wan_pipeline(disk_tmp, vae_config=WHOLE, ffn_chunk=16) as ours:
+        result = ours(PROMPT, NEGATIVE, **run)
+        assert result.stages["transformer"].details["ffn_chunk"] == 16
+        error = (result.latents.float() - expected.float()).norm() / expected.float().norm()
+        assert float(error) < 0.05, "rounding, not another video"
+    assert asked == [None, 45, 16]
+    with pytest.raises(ValueError, match="cannot run 0 tokens at a time"):
+        load_wan_pipeline(disk_tmp, ffn_chunk=0)
 
 
 @pytest.mark.cuda
@@ -439,3 +537,26 @@ def test_the_sizes_of_the_f3_criterion_run_within_3_4_gb(real_dir, height, width
         assert report.peak_process_bytes <= budget, name
         assert report.peak_process_bytes <= report.expected_peak_bytes, "the table holds"
     assert result.stages["transformer"].details["overlap_efficiency_median"] > 0.9
+
+
+@pytest.mark.slow
+@pytest.mark.cuda
+def test_the_longest_video_measured_runs_in_what_the_table_says(real_dir):
+    """720p x 121 frames, 27,280 tokens: one slot and the feed-forward networks in chunks."""
+    import torch
+
+    size = {"height": 704, "width": 1280, "num_frames": 121}
+    with load_wan_pipeline(real_dir, slots=1, ffn_chunk=wan.FFN_CHUNK) as ours:
+        expected = ours.check(**size)["transformer"]
+        embeds = ours.encode([REAL_CASES[0][0]])
+        latents = ours.denoise(embeds, **size, num_inference_steps=1, guidance_scale=1.0)
+        report = ours.reports[-1]
+    assert latents.shape == (1, 48, 31, 44, 80) and bool(torch.isfinite(latents).all())
+    assert report.details["tokens"] == 27_280 and report.details["ffn_chunk"] == wan.FFN_CHUNK
+    measured = dict(wan.TRANSFORMER_PEAKS[(1, "chunked")])[27_280]
+    print(
+        f"\n[pipeline] 27,280 tokens, 1 slot, ffn in chunks: {report.seconds:.1f} s, "
+        f"{report.peak_reserved_bytes / MiB:.0f} MiB reserved (measured {measured})"
+    )
+    assert report.peak_reserved_bytes <= measured * MiB, "the table holds"
+    assert report.peak_process_bytes <= report.expected_peak_bytes == expected

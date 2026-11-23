@@ -18,7 +18,8 @@ not: the VAE decodes in tiles, which is approximate (see
 :mod:`hypertier.diffusion.tiling`).
 
 Before anything is loaded, a generation is checked against the VRAM that is free, with the
-peaks measured for Wan 2.2 TI2V-5B: what does not fit is refused with what would.
+peaks measured for Wan 2.2 TI2V-5B: what does not fit is refused with what would, and so is
+what was not measured. Nothing is extrapolated.
 
 Needs the optional extra: ``pip install hypertier[diffusers]``. Importing this module imports
 neither PyTorch nor ``diffusers``.
@@ -73,24 +74,69 @@ TEXT_PEAK = 912 * MiB + CUDA_CONTEXT
 """VRAM the process holds at the peak of the text stage: umT5-XXL through two slots, two
 prompts of 512 tokens (880 MiB of allocator for one prompt)."""
 
-TRANSFORMER_BASE = {1: 538 * MiB + CUDA_CONTEXT, 2: 852 * MiB + CUDA_CONTEXT}
-TRANSFORMER_PER_TOKEN = 134_850
-TRANSFORMER_ONE_PASS = 114_300
-"""The peak of the transformer stage of Wan 2.2 TI2V-5B: so much whatever the video, by the
-number of slots, plus so many bytes per token, plus so many more per token when both
-branches of the guidance share a pass.
+FFN_CHUNK = 2048
+"""Tokens the feed-forward networks ran over at a time in the peaks measured "in chunks".
+Chunks of 512 and of 4,096 tokens gave the same peak at 12,090 tokens: once the networks are
+in chunks, the peak is somewhere else."""
 
-Fitted from above to what PyTorch's allocator reserved in runs of two guided steps, each in
-a process of its own, on the reference laptop::
+_WHOLE, _CHUNKED, _ONE_PASS = "whole", "chunked", "one pass"
 
-    tokens                1,950   5,070   11,440   12,090
-    two slots, MiB        1,098   1,502    2,304    2,402
-    one slot, MiB           784   1,188    1,990    2,088
-    two slots, one pass   1,310   2,034        -    3,236
+TRANSFORMER_PEAKS: dict[tuple[int, str], tuple[tuple[int, int], ...]] = {
+    (2, _WHOLE): (
+        (1_950, 1_098), (5_070, 1_502), (11_440, 2_304), (12_090, 2_402), (14_960, 2_752),
+        (16_720, 2_972), (18_480, 3_218), (20_240, 3_438),
+    ),
+    (1, _WHOLE): (
+        (1_950, 784), (5_070, 1_188), (11_440, 1_990), (12_090, 2_088), (14_960, 2_438),
+        (16_720, 2_658), (18_480, 2_904), (20_240, 3_124), (22_000, 3_338), (23_760, 3_572),
+    ),
+    (2, _CHUNKED): (
+        (1_950, 1_098), (5_070, 1_282), (11_440, 1_812), (12_090, 1_880), (14_960, 2_108),
+        (16_720, 2_252), (22_000, 2_706), (27_280, 3_158),
+    ),
+    (1, _CHUNKED): (
+        (1_950, 784), (5_070, 968), (11_440, 1_498), (12_090, 1_566), (14_960, 1_794),
+        (16_720, 1_938), (22_000, 2_392), (27_280, 2_844),
+    ),
+    (2, _ONE_PASS): ((1_950, 1_310), (5_070, 2_034), (11_440, 3_522), (12_090, 3_236)),
+    (1, _ONE_PASS): ((1_950, 996), (5_070, 1_720), (11_440, 3_208), (12_090, 3_348)),
+}  # fmt: skip
+"""The peak of the transformer stage of Wan 2.2 TI2V-5B by the number of tokens: ``(tokens,
+MiB)`` pairs as measured, fewest tokens first, for every way of running it that was measured:
+the number of slots, and the feed-forward networks whole, or in chunks of :data:`FFN_CHUNK`
+tokens, or both branches of the guidance in one pass over the weights.
 
-A slot is 312 MiB. One pass holds the time embedding of both branches at once before one row
-of it is kept, which is most of what it adds.
+A peak is what PyTorch's allocator reserved in a run of two guided steps, in a process of its
+own on the reference laptop, with 3,652 MiB of VRAM free. Between two measured numbers of
+tokens it is read off the line through them; above the most, nothing is known. The sizes are
+480p x 17, 49 and 121 frames (1,950, 5,070 and 12,090 tokens) and 720p x 49 to 121 (880 tokens
+per four frames: 11,440 to 27,280).
+
+Whole, the peak grows by 135 KB per token; in chunks by 85 KB, which is what lets 720p x 121
+run in 4 GB. A slot is 312 MiB. The longest video measured for a way is the longest that ran:
+the next length up was not tried where the last one left under 150 MiB free.
+
+One pass holds the time embedding of both branches at once before one row of it is kept,
+which is most of what it adds. Its two largest sizes ran with the VRAM almost full, where the
+allocator gives back what it has cached before it fails: the figure for two slots at 12,090
+tokens is lower than the one below it for that reason, not because it needs less.
 """
+
+
+def _between(points: Sequence[tuple[int, int]], at: int) -> float:
+    """The value at ``at`` of the line through the two measured ``points`` around it.
+
+    Before the first point it is the value of the first, and after the last that of the last:
+    no line is continued past what was measured.
+    """
+    x, y = points[0]
+    if at <= x:
+        return y
+    for further, more in points[1:]:
+        if at <= further:
+            return y + (more - y) * (at - x) / (further - x)
+        x, y = further, more
+    return y
 
 
 @dataclass(frozen=True)
@@ -119,6 +165,7 @@ class WanVideoPipeline(SequentialPipeline):
         model_dir: str | PathLike[str],
         *,
         slots: int = 2,
+        ffn_chunk: int | None = None,
         vae_config: VaeConfig | str | None = None,
         vram_budget: int | None = None,
         margin: int = VRAM_MARGIN,
@@ -128,6 +175,9 @@ class WanVideoPipeline(SequentialPipeline):
         self._diffusers = _import_diffusers()
         self.root = Path(model_dir)
         self.slots = slots
+        if ffn_chunk is not None and ffn_chunk < 1:
+            raise ValueError(f"cannot run {ffn_chunk} tokens at a time")
+        self.ffn_chunk = ffn_chunk
         if isinstance(vae_config, str):
             vae_config = vae_config_named(vae_config)
         self.vae_config = vae_config
@@ -182,12 +232,41 @@ class WanVideoPipeline(SequentialPipeline):
         p_t, p_h, p_w = self.patch_size
         return (frames // p_t) * (rows // p_h) * (columns // p_w)
 
-    def transformer_peak(self, tokens: int, *, slots: int, one_pass: bool = False) -> int | None:
-        """VRAM the process holds at the peak of the transformer stage, from measurements."""
-        if not self.measured or slots not in TRANSFORMER_BASE:
+    def transformer_peak(
+        self,
+        tokens: int,
+        *,
+        slots: int,
+        one_pass: bool = False,
+        ffn_chunk: int | None = None,
+    ) -> int | None:
+        """VRAM the process holds at the peak of the transformer stage, from measurements.
+
+        None for a model whose peaks were not measured. For Wan 2.2 TI2V-5B the peak is
+        interpolated between the numbers of tokens it was measured with
+        (:data:`TRANSFORMER_PEAKS`). With fewer tokens than the fewest measured it is the peak
+        of those, which it cannot exceed. With more than the most, or run in a way that was
+        not measured, nothing is known and nothing is made up: a ``ValueError``.
+        """
+        if not self.measured:
             return None
-        per_token = TRANSFORMER_PER_TOKEN + (TRANSFORMER_ONE_PASS if one_pass else 0)
-        return TRANSFORMER_BASE[slots] + per_token * tokens
+        chunked = ffn_chunk is not None and tokens > ffn_chunk
+        way = _ONE_PASS if one_pass else _CHUNKED if chunked else _WHOLE
+        how = _how(slots, one_pass, ffn_chunk if chunked else None)
+        points = TRANSFORMER_PEAKS.get((slots, way))
+        if points is None or (chunked and (one_pass or ffn_chunk > FFN_CHUNK)):
+            raise ValueError(
+                f"the VRAM the transformer needs was not measured with {how}: it is refused "
+                "instead of guessed"
+            )
+        most = points[-1][0]
+        if tokens > most:
+            raise ValueError(
+                f"the VRAM the transformer needs with {how} was measured up to {most} tokens: "
+                f"{tokens} tokens is outside what can be checked, and is refused instead of "
+                "guessed"
+            )
+        return round(_between(points, tokens) * MiB) + CUDA_CONTEXT
 
     def check(
         self, *, height: int, width: int, num_frames: int, one_pass: bool = False
@@ -206,8 +285,9 @@ class WanVideoPipeline(SequentialPipeline):
         process as the driver counts it, which ``bench_video`` samples while a generation
         runs: see :class:`~hypertier.adapters.hf_diffusers.VaeConfig`.
 
-        The peaks of the VAE were measured for videos of 17 to 121 frames. A length outside
-        that range is refused: nothing is extrapolated.
+        Nothing is extrapolated. The peaks of the VAE were measured for videos of 17 to 121
+        frames, and those of the transformer up to a number of tokens that depends on how it
+        runs (:data:`TRANSFORMER_PEAKS`): a video outside what was measured is refused.
         """
         if not self.measured:
             return {}
@@ -220,33 +300,51 @@ class WanVideoPipeline(SequentialPipeline):
             )
         available = self.available()
 
-        def fits(frames: int, slots: int) -> bool:
-            peak = self.transformer_peak(
-                self.tokens(height, width, frames), slots=slots, one_pass=one_pass
+        def peak(frames: int, slots: int, ffn_chunk: int | None) -> int:
+            tokens = self.tokens(height, width, frames)
+            found = self.transformer_peak(
+                tokens, slots=slots, one_pass=one_pass, ffn_chunk=ffn_chunk
             )
+            assert found is not None  # the model is the measured one
+            return found
+
+        def fits(frames: int, slots: int, ffn_chunk: int | None) -> bool:
             try:
                 self._vae_config(available, frames)
-            except ValueError:
+                return self.fits(peak(frames, slots, ffn_chunk), available)
+            except ValueError:  # too large for every VAE configuration, or not measured
                 return False
-            return peak is not None and self.fits(peak, available)
 
         tokens = self.tokens(height, width, num_frames)
-        peak = self.transformer_peak(tokens, slots=self.slots, one_pass=one_pass)
-        advice = []
-        if not fits(num_frames, self.slots):
-            if self.slots > 1 and fits(num_frames, 1):
+        if not fits(num_frames, self.slots, self.ffn_chunk):
+            advice = []
+            if self.slots > 1 and fits(num_frames, 1, self.ffn_chunk):
                 advice.append("slots=1 fits, at the price of copies that no longer overlap")
+            if self.ffn_chunk is None:
+                for slots in dict.fromkeys((self.slots, 1)):
+                    if fits(num_frames, slots, FFN_CHUNK):
+                        also = "" if slots == self.slots else " with slots=1"
+                        advice.append(
+                            f"ffn_chunk={FFN_CHUNK}{also} fits, with latents that differ by "
+                            "rounding"
+                        )
+                        break
             shorter = next(
                 (n for n in range(num_frames - self.temporal, shortest - 1, -self.temporal)
-                 if fits(n, self.slots)),
+                 if fits(n, self.slots, self.ffn_chunk)),
                 None,
             )  # fmt: skip
             if shorter is not None:
                 advice.append(f"{shorter} frames fit at {height} x {width}")
             hint = "Try: " + "; or ".join(advice) if advice else "Nothing shorter fits either"
-            if peak is not None and not self.fits(peak, available):
-                name = f"transformer ({tokens} tokens, {self.slots} slots)"
-                raise ValueError(self.shortfall(name, peak, available, hint))
+            try:
+                expected = peak(num_frames, self.slots, self.ffn_chunk)
+            except ValueError as not_measured:
+                raise ValueError(f"{not_measured}. {hint}") from None
+            if not self.fits(expected, available):
+                chunk = self.ffn_chunk if tokens > (self.ffn_chunk or tokens) else None
+                name = f"transformer ({tokens} tokens, {_how(self.slots, one_pass, chunk)})"
+                raise ValueError(self.shortfall(name, expected, available, hint))
             least = min(c.peak_bytes(num_frames) for c in self._vae_candidates())
             raise ValueError(
                 self.shortfall(f"VAE ({num_frames} frames)", least, available, hint)
@@ -254,7 +352,11 @@ class WanVideoPipeline(SequentialPipeline):
         if not self.fits(TEXT_PEAK, available):
             raise ValueError(self.shortfall("text", TEXT_PEAK, available))
         chosen = self._vae_config(available, num_frames)
-        return {"text": TEXT_PEAK, "transformer": peak, "vae": chosen.peak_bytes(num_frames)}
+        return {
+            "text": TEXT_PEAK,
+            "transformer": peak(num_frames, self.slots, self.ffn_chunk),
+            "vae": chosen.peak_bytes(num_frames),
+        }
 
     # -----------------------------------------------------------------------------------------
     # The stages
@@ -333,11 +435,17 @@ class WanVideoPipeline(SequentialPipeline):
         shape = self.latent_shape(height, width, num_frames)
         tokens = self.tokens(height, width, num_frames)
         guided = guidance_scale > 1.0
-        expected = self.transformer_peak(tokens, slots=self.slots, one_pass=one_pass and guided)
+        expected = self.transformer_peak(
+            tokens, slots=self.slots, one_pass=one_pass and guided, ffn_chunk=self.ffn_chunk
+        )
         with self.stage("transformer", expected) as report:
             started = time.perf_counter()
-            directory = self.root / "transformer"
-            with load_wan_transformer(directory, slots=self.slots, device=self.device) as streamed:
+            with load_wan_transformer(
+                self.root / "transformer",
+                slots=self.slots,
+                ffn_chunk=self.ffn_chunk,
+                device=self.device,
+            ) as streamed:
                 report.load_seconds = time.perf_counter() - started
                 latents = denoise(
                     streamed.model,
@@ -354,6 +462,7 @@ class WanVideoPipeline(SequentialPipeline):
                 report.details.update(
                     tokens=tokens,
                     slots=self.slots,
+                    ffn_chunk=self.ffn_chunk,
                     steps=num_inference_steps,
                     weights_vram_bytes=streamed.vram_bytes,
                     pinned_ram_bytes=streamed.ram_bytes,
@@ -483,6 +592,7 @@ def load_wan_pipeline(
     model_dir: str | PathLike[str],
     *,
     slots: int = 2,
+    ffn_chunk: int | None = None,
     vae_config: VaeConfig | str | None = None,
     vram_budget: int | None = None,
     margin: int = VRAM_MARGIN,
@@ -494,6 +604,10 @@ def load_wan_pipeline(
         model_dir: a ``diffusers`` pipeline directory (``model_index.json`` and one directory
             per component). Nothing is downloaded, and nothing is loaded yet.
         slots: VRAM buffers the transformer's blocks are streamed through.
+        ffn_chunk: run the feed-forward network of every transformer block over this many
+            tokens at a time: about a third less VRAM per token, for videos that do not fit
+            otherwise. **Not exact**: the latents differ by rounding from those of
+            ``WanPipeline`` (see :func:`~hypertier.diffusion.chunk_tokens`). None: whole.
         vae_config: how the VAE decodes: a
             :class:`~hypertier.adapters.hf_diffusers.VaeConfig` or the name of one. None
             takes the best one that this GPU can run and that fits when the stage starts.
@@ -511,6 +625,7 @@ def load_wan_pipeline(
     return WanVideoPipeline(
         model_dir,
         slots=slots,
+        ffn_chunk=ffn_chunk,
         vae_config=vae_config,
         vram_budget=vram_budget,
         margin=margin,
@@ -538,6 +653,16 @@ def _is_wan22_ti2v_5b(transformer: dict[str, Any], vae: dict[str, Any]) -> bool:
         and vae.get("scale_factor_spatial") == 16
         and vae.get("z_dim") == 48
     )
+
+
+def _how(slots: int, one_pass: bool, ffn_chunk: int | None) -> str:
+    """A way of running the transformer, as the messages name it."""
+    text = f"{slots} slot" + ("" if slots == 1 else "s")
+    if one_pass:
+        text += ", both branches of the guidance in one pass"
+    if ffn_chunk is not None:
+        text += f", the feed-forward networks {ffn_chunk} tokens at a time"
+    return text
 
 
 def _pass_summary(stats: Sequence[Any]) -> dict[str, Any]:
