@@ -369,6 +369,7 @@ def test_close_gives_the_skeleton_back(diffusers, disk_tmp):
 
     tiny_wan_transformer(disk_tmp)
     latent, text = inputs("bfloat16")
+    gc.collect()  # pipelines of earlier tests are freed by the collector, whenever it runs
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
     ours = load_wan_transformer(disk_tmp, ffn_chunk=16)
@@ -390,6 +391,7 @@ def test_what_cannot_be_loaded_is_refused(diffusers, disk_tmp):
     import torch
 
     tiny_wan_transformer(disk_tmp)
+    gc.collect()
     before = torch.cuda.memory_allocated()
     with pytest.raises(ValueError, match="tokens at a time"):
         load_wan_transformer(disk_tmp, ffn_chunk=0)
