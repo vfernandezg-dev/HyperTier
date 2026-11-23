@@ -232,6 +232,34 @@ def test_tiles_are_decoded_as_diffusers_decodes_them(
 
 
 @pytest.mark.cuda
+def test_the_layout_of_the_latents_in_memory_does_not_reach_the_decoder(diffusers, disk_tmp):
+    """A permuted view, as a sampling loop may return, decodes as the same latents laid out
+    in order: on the real VAE the other layout reserved up to 166 MiB more VRAM."""
+    import torch
+
+    tiny_wan_vae(disk_tmp)
+    sample = latents()
+    view = sample.permute(0, 2, 1, 3, 4).contiguous().permute(0, 2, 1, 3, 4)
+    assert torch.equal(view, sample) and not view.is_contiguous()
+    with load_wan_vae(disk_tmp, config("bfloat16", False, 30)) as ours:
+        seen = []
+        decode = ours.vae.decode
+
+        def spy(tile, **options):
+            seen.append(tile.stride())
+            return decode(tile, **options)
+
+        ours.vae.decode = spy
+        expected = ours.decode(sample)
+        in_order, seen[:] = list(seen), []
+        frames = ours.decode(view)
+        del ours.vae.decode
+    assert torch.equal(frames, expected)
+    assert len(in_order) > 1 and seen == in_order, "the same tiles, laid out the same way"
+    assert all(list(stride) == sorted(stride, reverse=True) for stride in seen)
+
+
+@pytest.mark.cuda
 def test_cudnn_benchmark_is_off_while_decoding_and_put_back(diffusers, disk_tmp):
     import torch
 
