@@ -742,6 +742,16 @@ def denoise_dmd(
     dtype of the transformer. Denormalising and decoding them is the VAE's stage.
 
     Bytes moved per step: every block once.
+
+    **The cache of PyTorch's allocator is emptied before every pass.** A pass leaves its
+    activations in that cache, and what the loop allocates between two passes (the clean
+    video in float64, the noise) is cut out of the largest of them, which the next pass then
+    has to reserve again: at 27,280 tokens the third pass reserved 320 MiB more, 3,318 MiB
+    against 3,012 with the cache emptied, in the same time (138 and 137 s). Emptied, a pass
+    no longer pays for what ran before it, which is what a peak measured once has to mean
+    (:data:`~hypertier.adapters.wan_pipeline.TRANSFORMER_PEAKS`). It is not a rule for every
+    loop: with fewer tokens it costs up to 68 MiB (2,308 MiB against 2,240 at 11,440 tokens),
+    and in the VAE, before every latent frame, 116 to 256 MiB.
     """
     import torch
 
@@ -771,6 +781,8 @@ def denoise_dmd(
         else:
             x = latents.to(device=device, dtype=torch.float32).permute(0, 2, 1, 3, 4)
         for index, t in enumerate(steps):
+            if device.type == "cuda":
+                torch.cuda.empty_cache()  # see the docstring: a pass starts from a clean cache
             velocity = transformer(
                 hidden_states=x.to(dtype).permute(0, 2, 1, 3, 4),
                 timestep=torch.tensor([t], dtype=torch.long, device=device),
