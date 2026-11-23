@@ -23,8 +23,12 @@ Triton kernels can be tested without a GPU by setting `TRITON_INTERPRET=1`.
 
 Without the script, `pip install -e ".[dev]"` is enough for what CI runs. The tests that load
 Hugging Face models and `benchmarks/bench_llm.py` also need a GPU, PyTorch and
-`pip install -e ".[test]"`; they are skipped otherwise. Tests on real checkpoints read their
-directory from the `HYPERTIER_MODELS` environment variable and are skipped without it.
+`pip install -e ".[test]"`; they are skipped otherwise.
+
+Tests on real checkpoints are marked `slow`, and a plain `pytest` leaves them out. Run them
+with `pytest -m slow -rs` (about six minutes on a 4 GB laptop GPU). They read the directory of
+the checkpoints from the `HYPERTIER_MODELS` environment variable and are skipped without it, or
+without the checkpoint they need: `-rs` lists what was skipped, and a skipped test did not run.
 
 ## Pull requests
 
@@ -32,6 +36,10 @@ directory from the `HYPERTIER_MODELS` environment variable and are skipped witho
 2. Keep PRs focused; include tests for new behavior.
 3. For performance changes, include before/after numbers and the hardware used.
 4. Run `pytest` and `ruff check .` before submitting.
+   If the PR touches `src/hypertier/stream/`, `src/hypertier/adapters/` or
+   `src/hypertier/diffusion/`, also run `pytest -m slow -rs`, and say in the description that
+   you did and which tests were skipped. If you cannot run them (no GPU, or no checkpoints),
+   say that instead: a maintainer then has to run them before the PR is merged.
 5. Sign off every commit (see below).
 
 ## Developer Certificate of Origin (DCO)

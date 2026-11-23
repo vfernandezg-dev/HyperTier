@@ -60,7 +60,8 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
 bash scripts/setup_linux.sh
 source .venv/bin/activate
 
-pytest -q                       # tests
+pytest -q                       # tests, without the slow ones
+pytest -q -m slow -rs           # the slow ones: real checkpoints (HYPERTIER_MODELS), ~6 minutes
 TRITON_INTERPRET=1 pytest -q    # run Triton kernels on CPU (no GPU needed)
 python benchmarks/bench_hw.py   # hardware profile -> benchmarks/results/hw_*.json (--quick: smoke)
 python benchmarks/bench_streaming.py  # streaming vs resident model -> results/streaming_*.json
@@ -207,6 +208,9 @@ Create modules only when the current phase needs them.
   with the result. On the reference laptop a pass takes about 6 % longer once the GPU is hot.
 - Tests and benchmarks that need real checkpoints read their directory from `HYPERTIER_MODELS`
   (set it in the git-ignored `.env`) and skip without it. Never write that path in the repo.
+- Those tests are marked `slow`, and a plain `pytest` leaves them out. A PR that touches
+  `stream/`, `adapters/` or `diffusion/` also runs `pytest -m slow -rs` and says so in its
+  description, with the tests that were skipped: a skipped test did not run.
 
 ## Git and contributions
 

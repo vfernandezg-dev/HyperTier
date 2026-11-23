@@ -196,6 +196,7 @@ def test_holes_between_tensors_are_allowed(tmp_path):
     assert len(index.runs(["a", "b"])) == 2
 
 
+@pytest.mark.slow
 def test_real_checkpoint_layers_are_single_runs(models_dir):
     root = models_dir / "Qwen3-8B"
     if not root.is_dir():

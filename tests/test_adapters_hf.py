@@ -256,6 +256,7 @@ def test_an_old_transformers_is_reported(transformers, disk_tmp, monkeypatch):
         load_causal_lm(disk_tmp)
 
 
+@pytest.mark.slow
 @pytest.mark.cuda
 def test_real_checkpoint_generates_the_tokens_of_the_resident_model(transformers, models_dir):
     import torch
@@ -403,6 +404,7 @@ def test_a_text_encoder_that_does_not_match_its_checkpoint_is_refused(transforme
     assert not reader_threads()
 
 
+@pytest.mark.slow
 @pytest.mark.cuda
 def test_the_real_umt5_gives_the_same_embeddings_from_disk_and_from_ram(
     transformers, models_dir
