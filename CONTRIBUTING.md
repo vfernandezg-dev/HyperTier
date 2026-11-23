@@ -32,7 +32,7 @@ under the GPL, version 3 or later. It runs as a program of its own, and nothing 
 links to it or ships it; that is why it is an extra of its own and not part of `test`.
 
 Tests on real checkpoints are marked `slow`, and a plain `pytest` leaves them out. Run them
-with `pytest -m slow -rs` (about six minutes on a 4 GB laptop GPU). They read the directory of
+with `pytest -m slow -rs` (about twenty minutes on a 4 GB laptop GPU). They read the directory of
 the checkpoints from the `HYPERTIER_MODELS` environment variable and are skipped without it, or
 without the checkpoint they need: `-rs` lists what was skipped, and a skipped test did not run.
 
