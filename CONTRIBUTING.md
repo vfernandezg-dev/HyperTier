@@ -25,6 +25,12 @@ Without the script, `pip install -e ".[dev]"` is enough for what CI runs. The te
 Hugging Face models and `benchmarks/bench_llm.py` also need a GPU, PyTorch and
 `pip install -e ".[test]"`; they are skipped otherwise.
 
+`benchmarks/bench_video.py` writes the video it generates as an animated WebP. With
+`pip install -e ".[video]"` (`imageio` and `imageio-ffmpeg`) it writes an MP4 instead. Both
+packages are BSD-2-Clause, but the wheel of `imageio-ffmpeg` carries an `ffmpeg` executable
+under the GPL, version 3 or later. It runs as a program of its own, and nothing in HyperTier
+links to it or ships it; that is why it is an extra of its own and not part of `test`.
+
 Tests on real checkpoints are marked `slow`, and a plain `pytest` leaves them out. Run them
 with `pytest -m slow -rs` (about six minutes on a 4 GB laptop GPU). They read the directory of
 the checkpoints from the `HYPERTIER_MODELS` environment variable and are skipped without it, or

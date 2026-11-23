@@ -24,8 +24,9 @@ Timings are of a warm GPU: it is kept busy for ``--warm-up`` seconds first, and 
 temperature goes into the result. Everything, with the metadata needed to reproduce the run,
 goes to ``benchmarks/results/video_<UTC timestamp>.json``; a summary is printed. The video
 itself is written next to it under the same name: numbers do not show a broken picture. It
-is an ``.mp4`` when ``diffusers`` can encode one (``imageio`` with ffmpeg, or OpenCV), and
-otherwise an animated ``.webp``, which Pillow always writes and a browser plays.
+is an ``.mp4`` with the optional extra (``pip install hypertier[video]``: ``imageio`` and
+``imageio-ffmpeg``), and otherwise an animated ``.webp``, which Pillow always writes and a
+browser plays. See :func:`save_video` for the license of the ffmpeg that extra brings.
 
 Run it from a checkout that nothing edits meanwhile (``git worktree add`` at a commit): every
 measurement is a new process that imports the code as it is on disk at that moment.
@@ -39,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import importlib.util
 import json
 import os
 import shutil
@@ -64,6 +66,7 @@ if TYPE_CHECKING:
 SCHEMA = "hypertier.bench_video/1"
 CUBLAS_WORKSPACE = ":4096:8"
 GB = 1000**3
+MP4_HINT = "for an MP4, pip install hypertier[video] (imageio and imageio-ffmpeg)"
 PROMPT = (
     "Two anthropomorphic cats in comfy boxing gear and bright gloves fight intensely on a "
     "spotlighted stage."
@@ -180,26 +183,48 @@ def _used_now() -> int | None:
     return int(found["memory.used"]) * MiB if found else None
 
 
-def save_video(frames: Any, path: Path, fps: int) -> Path:
-    """Write ``uint8`` frames ``[frames, height, width, 3]`` as a video; returns the file.
+def mp4_encoder() -> bool:
+    """Whether the optional extra that writes an MP4 is installed: ``hypertier[video]``."""
+    return all(importlib.util.find_spec(name) for name in ("imageio", "imageio_ffmpeg"))
 
-    ``path`` is taken without its suffix: ``.mp4`` when ``diffusers`` has an encoder for it,
-    an animated ``.webp`` written by Pillow otherwise.
+
+def save_video(frames: Any, path: Path, fps: int) -> tuple[Path, str | None]:
+    """Write ``uint8`` frames ``[frames, height, width, 3]`` as a video.
+
+    ``path`` is taken without its suffix. With ``imageio`` and ``imageio-ffmpeg`` installed
+    (``pip install hypertier[video]``) the file is an ``.mp4`` in H.264. Without them, or if
+    encoding fails, it is an animated ``.webp`` from Pillow. Returns the file, and why it is
+    not an MP4 when it is not.
+
+    Both packages are BSD-2-Clause, but the wheel of ``imageio-ffmpeg`` carries an ``ffmpeg``
+    executable built with ``--enable-gpl --enable-version3``: GPL, version 3 or later. It runs
+    as a program of its own; nothing here links to it or ships it. That is why it is an extra
+    of its own and not part of ``test``.
     """
+    array = frames.numpy()
+    why = MP4_HINT
+    if mp4_encoder():
+        target = path.with_suffix(".mp4")
+        try:
+            import imageio.v2 as imageio
+
+            with imageio.get_writer(target, format="FFMPEG", mode="I", fps=fps, quality=8) as out:
+                for frame in array:
+                    out.append_data(frame)
+            return target, None
+        except (ImportError, OSError, RuntimeError, ValueError) as exc:
+            # No ffmpeg for this platform, or it failed: the measurement is not lost for it.
+            target.unlink(missing_ok=True)
+            why = f"the MP4 could not be written ({type(exc).__name__}: {exc})"
     from PIL import Image
 
-    images = [Image.fromarray(frame) for frame in frames.numpy()]
-    try:
-        from diffusers.utils import export_to_video
-
-        return Path(export_to_video(images, str(path.with_suffix(".mp4")), fps=fps))
-    except (ImportError, ValueError):  # no imageio with ffmpeg, and no OpenCV
-        target = path.with_suffix(".webp")
-        images[0].save(
-            target, save_all=True, append_images=images[1:], duration=round(1000 / fps),
-            loop=0, quality=90, method=4,
-        )  # fmt: skip
-        return target
+    images = [Image.fromarray(frame) for frame in array]
+    target = path.with_suffix(".webp")
+    images[0].save(
+        target, save_all=True, append_images=images[1:], duration=round(1000 / fps),
+        loop=0, quality=90, method=4,
+    )  # fmt: skip
+    return target, why
 
 
 def worker_generate(job: dict[str, Any], torch: Any) -> dict[str, Any]:
@@ -238,8 +263,10 @@ def worker_generate(job: dict[str, Any], torch: Any) -> dict[str, Any]:
     result["frames_shape"] = list(frames.shape)
     result["measured_model"] = pipeline.measured
     if cfg["save_video"]:
-        written = save_video(frames, Path(job["video"]), cfg["fps"])
+        written, why = save_video(frames, Path(job["video"]), cfg["fps"])
         result["video"] = {"format": written.suffix[1:], "fps": cfg["fps"], "file": written.name}
+        if why is not None:
+            result["video"]["not_mp4"] = why
     keep = min(cfg["psnr_frames"], frames.shape[0])
     tensors = {"embeds": embeds, "latents": latents, "frames": frames[:keep].clone()}
     return {"result": result, "tensors": tensors}
@@ -539,6 +566,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"\nResults written to {path}")
     if video is not None:
         print(f"Video written to {kept}")
+        if "not_mp4" in video:
+            print(f"  An animated WebP: {video['not_mp4']}")
     checks = payload["results"]["checks"]
     failed = "error" in payload["results"]["generate"] or not all(checks.values())
     return 1 if failed else 0

@@ -45,6 +45,11 @@ dev = ["pytest>=8", "ruff>=0.6", "build", "twine"]
 # is only a baseline to compare against: nothing in the package imports it. CI installs
 # "dev" alone and skips these tests.
 test = ["transformers>=5.24", "accelerate>=1.16", "diffusers>=0.43", "ftfy"]
+# bench_video writes its video as an MP4 with these, and as an animated WebP without them.
+# 2.38 and 0.8 are the oldest releases it is tested with. Not part of "test": both are
+# BSD-2-Clause, but the wheel of imageio-ffmpeg carries an ffmpeg executable under the GPL
+# (version 3 or later), which runs as a program of its own.
+video = ["imageio>=2.38", "imageio-ffmpeg>=0.8"]
 
 [project.urls]
 Homepage = "https://github.com/vfernandezg-dev/HyperTier"
