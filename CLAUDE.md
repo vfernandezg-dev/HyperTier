@@ -37,6 +37,8 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
   (the model does not guarantee quality at 480p). Measured on Wan 2.2 TI2V-5B with 2 slots:
   latents equal to `WanPipeline` bit for bit, 0.80 GiB of weights in VRAM, 1.8 GiB allocated at
   the peak and 12.8-13.9 s per pass at about 12,000 tokens, with the GPU at 85 °C.
+  The VAE decodes in tiles (`diffusion/tiling.py`, `load_wan_vae`): a whole video in 124-128 s
+  with 2.75 GiB of VRAM at the peak in the configuration this laptop gets (bf16, resident).
 - F1 exit criterion, measured with `bench_llm` on Qwen3-8B (2 slots, all blocks in RAM): same
   tokens as the strict baseline, 0.77 GB of weights in VRAM, prefill overlap efficiency
   0.90-1.00; 2.28 s/token against 2.88 with `accelerate` offloading, at a third of its peak VRAM.
@@ -153,8 +155,16 @@ Create modules only when the current phase needs them.
    Do not compress activations in the compute path; bound their peak by splitting the work.
    Splitting is not all exact. Chunking a module over tokens or over the batch computes the
    same values up to rounding: 1 ulp of bf16 measured, because another shape picks another
-   kernel. Spatial VAE tiling is **approximate**: 40-43 dB of PSNR against the untiled
-   decode, measured on the Wan 2.2 VAE at 480p with 256 px tiles overlapping 32-64 px.
+   kernel. Spatial VAE tiling is **approximate**: 38-55 dB of PSNR against the untiled
+   float32 decode on the Wan 2.2 VAE, five prompts at 720p x 49 and 480p x 121. The picture
+   decides most of it (15 dB between prompts), then the tile (340 latent cells instead of 256:
+   +1.2-2.7 dB), then the dtype (float32 over bf16 with the same tiles: +0.3-0.8 dB). So the
+   VAE has three configurations, best first: bf16 with streamed weights and tiles of 600
+   cells (3,085 MiB at the peak, 106 s per video), bf16 resident with 340 (2,815 MiB,
+   124-128 s), float32 streamed with 256 (2,445 MiB, 293-297 s). `choose_vae_config` takes the
+   first whose measured peak leaves 300 MiB of the VRAM budget, and each has a PSNR
+   threshold: the lowest measured less 1 dB. Tiles go through the public `vae.decode` and are
+   blended in host RAM; `enable_tiling()` of `diffusers` keeps every tile on the GPU.
 6. **Triton first, PyTorch fallback.** Kernels must also run under `TRITON_INTERPRET=1` and be
    tested bit-exact (or within tolerance) against a pure-PyTorch reference.
 7. **Native Linux first.** Development and benchmarks run on native Linux only; WSL2 is no longer
