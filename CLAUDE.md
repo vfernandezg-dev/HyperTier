@@ -145,8 +145,10 @@ Create modules only when the current phase needs them.
    parameter, so every module that holds it gets the same table. Its blocks are read from
    disk on every call by default, with only the staging buffers pinned: the stage runs once
    per prompt (umT5-XXL of Wan 2.2: 1.7 s to load and 3.4 s per call from disk, 9.8 s and
-   1.4-1.8 s with 8.63 GiB pinned). A batch of two prompts does not round like two batches
-   of one: to equal `diffusers` bit for bit, encode each prompt in its own pass.
+   1.4-1.8 s with 8.63 GiB pinned). A real batch of two prompts does not round like two
+   batches of one, and `diffusers` encodes each prompt in a pass of its own. So every block
+   runs the batch one prompt at a time while its weights are in the slot: the bits of a pass
+   per prompt, with the weights read once (3.3 s for two prompts instead of 6.7 s).
 5. **Weights stream as 4-bit / fp8 / lossless (DFloat11-style)**, never "2.5-bit lossless".
    Do not compress activations in the compute path; bound their peak by splitting the work.
    Splitting is not all exact. Chunking a module over tokens or over the batch computes the

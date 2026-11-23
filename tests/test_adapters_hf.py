@@ -313,22 +313,30 @@ def reader_threads():
         ("umt5", "float32", 1, False), ("t5", "bfloat16", 3, False), ("t5", "float32", 2, True),
     ],
 )  # fmt: skip
-def test_a_text_encoder_gives_the_hidden_states_of_the_resident_model(
+def test_a_text_encoder_gives_each_prompt_the_hidden_states_it_gets_alone(
     transformers, disk_tmp, family, dtype, slots, keep_in_ram
 ):
+    """A batch in one pass over the weights, with the bits of the resident model fed one
+    prompt at a time: that is how the pipelines of ``diffusers`` encode their prompts."""
     import torch
 
     tiny_text_encoder(disk_tmp, family, dtype=dtype)
     ids, mask = padded_prompts()
+    ids, mask = ids.cuda(), mask.cuda()
+    resident = load_resident_encoder(disk_tmp)
     with torch.inference_mode():
-        want = load_resident_encoder(disk_tmp)(ids.cuda(), mask.cuda()).last_hidden_state
+        alone = [resident(ids[i : i + 1], mask[i : i + 1]).last_hidden_state for i in range(2)]
+    want = torch.cat(alone)
     assert bool(torch.isfinite(want).all()) and float(want.float().std()) > 0.01
     with load_text_encoder(disk_tmp, slots=slots, keep_in_ram=keep_in_ram) as streamed:
         assert set(streamed.streamer.tiers) == {"ram" if keep_in_ram else "nvme"}
         with torch.inference_mode():
             for _ in range(2):  # the second call streams every block again
-                got = streamed.model(ids.cuda(), mask.cuda()).last_hidden_state
+                got = streamed.model(ids, mask).last_hidden_state
                 assert got.device.type == "cuda" and torch.equal(got, want)
+            assert len(streamed.streamer.pass_stats()) == 2, "one pass per call, not per prompt"
+            got = streamed.model(ids[1:], mask[1:]).last_hidden_state
+            assert torch.equal(got, alone[1])
 
 
 @pytest.mark.cuda
@@ -381,6 +389,7 @@ def test_closing_a_text_encoder_undoes_everything(transformers, disk_tmp):
     assert all(p.device.type == "meta" for p in model.parameters())
     for module in (model.shared, model.encoder.embed_tokens):
         assert not module._forward_hooks and not module._forward_pre_hooks
+    assert not [module for module in model.modules() if "forward" in vars(module)]
     assert torch.cuda.memory_allocated() == before
     assert not reader_threads()
 
@@ -426,10 +435,15 @@ def test_the_real_umt5_gives_the_same_embeddings_from_disk_and_from_ram(
             assert streamed.streamer.num_blocks == 24
             assert streamed.vram_bytes <= 737 * MiB  # two slots of 368 MiB against 8.6 GiB
             assert (streamed.ram_bytes > 8 * 1024 * MiB) == keep_in_ram
+            ids, mask = batch.input_ids.cuda(), batch.attention_mask.cuda()
             with torch.inference_mode():
-                hidden = streamed.model(batch.input_ids.cuda(), batch.attention_mask.cuda())
-            outputs.append(hidden.last_hidden_state.cpu())
-            del hidden  # the output is the last thing of the model on the GPU
+                hidden = streamed.model(ids, mask)
+                outputs.append(hidden.last_hidden_state.cpu())
+                if keep_in_ram:  # each prompt in a pass of its own, as diffusers encodes them
+                    alone = [streamed.model(ids[i : i + 1], mask[i : i + 1]) for i in range(2)]
+                    alone = torch.cat([out.last_hidden_state.cpu() for out in alone])
+            del hidden, ids, mask  # the last things of this call on the GPU
         assert torch.cuda.memory_allocated() == before
     assert outputs[0].shape == (2, 512, 4096) and bool(torch.isfinite(outputs[0]).all())
     assert torch.equal(outputs[0], outputs[1])
+    assert torch.equal(outputs[0], alone), "two prompts in one pass: the bits of a pass each"
