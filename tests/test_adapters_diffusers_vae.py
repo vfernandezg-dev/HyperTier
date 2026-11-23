@@ -7,7 +7,8 @@ A tiny random Wan VAE of the 2.2 kind (16 px per latent cell) is saved as a norm
 and compared with the same checkpoint loaded by ``diffusers``, resident in VRAM. Two things
 are exact and compared bit for bit: a frame that fits in one tile against the whole decode of
 ``diffusers``, and every tile against the same tile through ``diffusers``. Tiling itself is
-not: on the real VAE it is judged by PSNR against the untiled float32 decode (``-m slow``).
+not: on the real VAE it is judged by PSNR against the untiled float32 decode (``-m slow``),
+on a clip sampled by the model in ten steps and on one sampled by FastWan in three.
 """
 
 import gc
@@ -21,6 +22,7 @@ from hypertier.adapters.hf_diffusers import (
     VaeConfig,
     choose_vae_config,
     denoise,
+    denoise_dmd,
     load_wan_transformer,
     load_wan_vae,
     usable_vae_configs,
@@ -323,6 +325,8 @@ def test_what_cannot_be_loaded_or_decoded_is_refused(diffusers, disk_tmp):
 # The real VAE: Wan 2.2 TI2V-5B (needs HYPERTIER_MODELS and -m slow)
 
 REAL = "Wan2.2-TI2V-5B-Diffusers"
+FAST = "FastWan2.2-TI2V-5B-FullAttn-Diffusers"  # its transformer, distilled for three steps
+FAST_STEPS = (1000, 757, 522)
 CLIP = (3, 30, 52)  # 480p x 9 frames: short to sample, and as wide as the long mode
 COMPARED = 2  # latent frames decoded and compared: the first 5 frames
 PROMPT = (
@@ -353,13 +357,8 @@ def real_dir():
 
 
 @pytest.fixture(scope="module")
-def real_clip(real_dir):
-    """Latents of a real video, sampled here: text encoder, then transformer, 10 steps.
-
-    Tiling is judged on what the model draws: random latents decode to noise, where the
-    borders of a tile matter in another way.
-    """
-    import diffusers
+def real_embeds(real_dir):
+    """The prompt and the negative prompt through the real text encoder."""
     import torch
     import transformers
     from diffusers.pipelines.wan.pipeline_wan import prompt_clean
@@ -378,16 +377,41 @@ def real_clip(real_dir):
         hidden[row, used:] = 0  # as WanPipeline: the tokens of the prompt, then zeros
     gc.collect()
     torch.cuda.empty_cache()
-    with load_wan_transformer(real_dir / "transformer") as transformer:
-        clip = denoise(
-            transformer.model,
-            diffusers.UniPCMultistepScheduler.from_pretrained(real_dir / "scheduler"),
-            hidden[:1], hidden[1:], latent_shape=CLIP, expand_timesteps=True,
-            num_inference_steps=10, generator=torch.Generator("cpu").manual_seed(0),
-        ).cpu()  # fmt: skip
+    return hidden
+
+
+@pytest.fixture(scope="module", params=["wan", "fastwan"])
+def real_clip(request, real_dir, real_embeds):
+    """Latents of a real video, sampled here: ten steps of the model, or three of FastWan.
+
+    Tiling is judged on what a model draws: random latents decode to noise, where the
+    borders of a tile matter in another way. Both samplers, because the thresholds were
+    measured on the first and a video in few steps is what most users will decode.
+    """
+    import diffusers
+    import torch
+
+    seeded = torch.Generator("cpu").manual_seed(0)
+    if request.param == "fastwan":
+        fast = real_dir.parent / FAST / "transformer"
+        if not fast.is_dir():
+            pytest.skip(f"set HYPERTIER_MODELS to a directory that holds {FAST}")
+        with load_wan_transformer(fast) as transformer:
+            clip = denoise_dmd(
+                transformer.model, real_embeds[:1], latent_shape=CLIP, timesteps=FAST_STEPS,
+                generator=seeded,
+            ).cpu()  # fmt: skip
+    else:
+        with load_wan_transformer(real_dir / "transformer") as transformer:
+            clip = denoise(
+                transformer.model,
+                diffusers.UniPCMultistepScheduler.from_pretrained(real_dir / "scheduler"),
+                real_embeds[:1], real_embeds[1:], latent_shape=CLIP, expand_timesteps=True,
+                num_inference_steps=10, generator=seeded,
+            ).cpu()  # fmt: skip
     gc.collect()
     torch.cuda.empty_cache()
-    return clip[:, :, :COMPARED]
+    return clip[:, :, :COMPARED].float()
 
 
 @pytest.fixture(scope="module")
@@ -410,10 +434,11 @@ def real_reference(real_dir, real_clip):
 @pytest.mark.cuda
 @pytest.mark.parametrize("name", [known.name for known in VAE_CONFIGS])
 def test_the_real_vae_reaches_the_psnr_of_its_configuration(
-    real_dir, real_clip, real_reference, name
+    request, real_dir, real_clip, real_reference, name
 ):
     import torch
 
+    sampler = request.node.callspec.params["real_clip"]
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -424,7 +449,7 @@ def test_the_real_vae_reaches_the_psnr_of_its_configuration(
         reserved = torch.cuda.max_memory_reserved()
     quality = psnr(frames, real_reference)
     print(
-        f"\n[vae] {name}: {plan.count} tiles of {plan.tile[0]} x {plan.tile[1]} cells, "
+        f"\n[vae] {sampler}, {name}: {plan.count} tiles of {plan.tile[0]} x {plan.tile[1]} cells, "
         f"{quality:.1f} dB against the untiled float32 decode (at least "
         f"{chosen.min_psnr_db:.1f}), {reserved / MiB:.0f} MiB reserved at the peak"
     )
