@@ -69,7 +69,7 @@ bash scripts/setup_linux.sh
 source .venv/bin/activate
 
 pytest -q                       # tests, without the slow ones
-pytest -q -m slow -rs           # the slow ones: real checkpoints (HYPERTIER_MODELS), ~6 minutes
+pytest -q -m slow -rs           # the slow ones: real checkpoints (HYPERTIER_MODELS), ~20 minutes
 TRITON_INTERPRET=1 pytest -q    # run Triton kernels on CPU (no GPU needed)
 python benchmarks/bench_hw.py   # hardware profile -> benchmarks/results/hw_*.json (--quick: smoke)
 python benchmarks/bench_streaming.py  # streaming vs resident model -> results/streaming_*.json
@@ -218,13 +218,27 @@ Create modules only when the current phase needs them.
     it, once the previous stage is released and the cache emptied, less a margin of 300 MiB;
     a caller's `vram_budget` can only lower it. What a stage needs comes from peaks measured
     on the reference laptop, and a generation that does not fit is refused at once with what
-    would (one slot, fewer frames), not minutes later with an out-of-memory error. For Wan
-    2.2 TI2V-5B: text 1.03 GiB; transformer 0.97 GiB plus 135 KB per token with two slots
-    (0.31 GiB less with one); VAE by configuration and length. Like is compared with like:
-    a peak is what PyTorch's allocator reserved in a run of its own plus 143 MiB of CUDA
-    context, and the budget is the VRAM free after `empty_cache()` plus what the process
-    holds. The 3.4 GB of the F3 criterion is a third thing, the peak of the process as the
-    driver counts it, which `bench_video` samples during a whole generation.
+    would (one slot, the FFN in chunks, fewer frames), not minutes later with an
+    out-of-memory error. **Nothing is extrapolated**: between two measured sizes a peak is
+    interpolated, and a size outside what was measured is refused. For Wan 2.2 TI2V-5B, as
+    the allocator reserved it: text 912 MiB; the transformer by tokens (`TRANSFORMER_PEAKS`:
+    135 KB per token, 85 KB with the FFN in chunks, measured up to 20,240 tokens with two
+    slots, 23,760 with one, and 27,280 in chunks, which is 720p x 121); the VAE by
+    configuration and length. Like is compared with like: a peak is what PyTorch's allocator
+    reserved in a run of its own plus `CUDA_CONTEXT`, and the budget is the VRAM free after
+    `empty_cache()` plus what the process holds, read from the driver. The 3.4 GB of the F3
+    criterion is a third thing, the peak of the process as the driver counts it, which
+    `bench_video` samples during a whole generation.
+    The CUDA context **grows while the stages run**: CUDA loads each kernel the first time it
+    is used, so every new kind of operation adds a little and the first stage adds most.
+    Outside the allocator a process holds 77 MiB when created, 123 after the text stage and
+    up to 155 in the transformer; 209 as `bench_video` runs its workers (with
+    `CUBLAS_WORKSPACE_CONFIG=:4096:8`, cuBLAS keeps a larger workspace of its own). A small
+    matmul, convolution and attention beforehand load 20 MiB of that: it cannot be warmed up
+    cheaply. So a peak is counted with the most ever measured (`CUDA_CONTEXT`, 210 MiB), the
+    context counts as already held only for what it holds now, and each `StageReport` has
+    what the driver said while the stage was loaded. Page-locked RAM costs 2 MiB of VRAM
+    per GiB for as long as it is registered.
 
 ## Coding conventions
 
