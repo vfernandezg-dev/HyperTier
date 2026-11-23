@@ -3,6 +3,8 @@
 
 """Tests for hypertier.diffusion.sequential: the budget and the record of a stage (GPU)."""
 
+import logging
+
 import pytest
 
 from hypertier.diffusion.sequential import (
@@ -113,6 +115,30 @@ def test_the_context_of_a_stage_is_read_from_the_driver_or_is_what_the_peaks_cou
         pass
     assert report.context_bytes == CUDA_CONTEXT and not report.context_measured
     assert report.peak_process_bytes == report.peak_reserved_bytes + CUDA_CONTEXT
+
+
+@pytest.mark.cuda
+def test_a_context_above_what_the_peaks_count_is_logged_and_the_stage_goes_on(monkeypatch, caplog):
+    """On another GPU or driver the context may be larger than the one measured here."""
+    pipeline = SequentialPipeline()
+    caplog.set_level(logging.WARNING, logger="hypertier.diffusion.sequential")
+    monkeypatch.setattr(pipeline, "context", lambda: CUDA_CONTEXT + 30 * MiB)
+    with pipeline.stage("vae") as report:
+        ran = True
+    assert ran and report.context_bytes == CUDA_CONTEXT + 30 * MiB
+    (record,) = caplog.records
+    assert record.levelno == logging.WARNING and record.name == "hypertier.diffusion.sequential"
+    message = record.getMessage()
+    assert "the vae stage held 240.0 MiB of VRAM outside PyTorch's allocator" in message
+    assert "210.0 MiB expected peaks are counted with (CUDA_CONTEXT)" in message
+    assert "up to 30.0 MiB more" in message and "margin of 300.0 MiB" in message
+    caplog.clear()
+    # At what the peaks count, or when the driver does not say, there is nothing to report.
+    for context in (CUDA_CONTEXT, 70 * MiB, None):
+        monkeypatch.setattr(pipeline, "context", lambda context=context: context)
+        with pipeline.stage("quiet"):
+            pass
+    assert not caplog.records
 
 
 @pytest.mark.cuda

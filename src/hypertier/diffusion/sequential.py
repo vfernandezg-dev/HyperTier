@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import logging
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -48,6 +49,8 @@ from typing import Any
 
 from hypertier.telemetry._common import MiB, format_bytes, require_cuda, resolve_device
 from hypertier.telemetry.vram import process_vram
+
+logger = logging.getLogger(__name__)
 
 VRAM_MARGIN = 300 * MiB
 """VRAM left free above the expected peak of a stage. The peaks are measurements on one
@@ -58,7 +61,11 @@ CUDA_CONTEXT = 210 * MiB
 counted with. The most measured on the reference laptop is 209 MiB (see the module
 docstring). What a process holds now is read from the driver; this number is for what cannot
 be read: how far the context will have grown at the peak of a stage that has not run yet,
-and what the process holds when the driver does not say (WSL2)."""
+and what the process holds when the driver does not say (WSL2).
+
+It is a measurement on one GPU with one driver. A stage that ends with more than this outside
+the allocator logs a warning: its expected peak was short by the difference, and only the
+margin stood between that and running out of memory."""
 
 
 @dataclass
@@ -222,6 +229,20 @@ class SequentialPipeline:
                 self.read_context(report)
             report.peak_process_bytes = report.peak_reserved_bytes + report.context_bytes
             self.reports.append(report)
+            if report.context_measured and report.context_bytes > CUDA_CONTEXT:
+                # Not an error: the stage ran. But the peaks are counted with less than this
+                # GPU and driver need, and whoever reads the log should know before it fails.
+                logger.warning(
+                    "the %s stage held %s of VRAM outside PyTorch's allocator, more than the "
+                    "%s expected peaks are counted with (CUDA_CONTEXT): on this GPU and "
+                    "driver a stage needs up to %s more than it is admitted with, and only "
+                    "the margin of %s covers that",
+                    name,
+                    format_bytes(report.context_bytes),
+                    format_bytes(CUDA_CONTEXT),
+                    format_bytes(report.context_bytes - CUDA_CONTEXT),
+                    format_bytes(self.margin),
+                )
 
     def shortfall(self, name: str, expected_peak: int, available: int, advice: str = "") -> str:
         """The message of a stage that does not fit."""
