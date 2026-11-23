@@ -87,6 +87,7 @@ Chunks of 512 and of 4,096 tokens gave the same peak at 12,090 tokens: once the 
 in chunks, the peak is somewhere else."""
 
 _WHOLE, _CHUNKED, _ONE_PASS = "whole", "chunked", "one pass"
+_FEW, _FEW_CHUNKED = "few steps", "few steps, chunked"
 
 TRANSFORMER_PEAKS: dict[tuple[int, str], tuple[tuple[int, int], ...]] = {
     (2, _WHOLE): (
@@ -107,6 +108,22 @@ TRANSFORMER_PEAKS: dict[tuple[int, str], tuple[tuple[int, int], ...]] = {
     ),
     (2, _ONE_PASS): ((1_950, 1_310), (5_070, 2_034), (11_440, 3_522), (12_090, 3_236)),
     (1, _ONE_PASS): ((1_950, 996), (5_070, 1_720), (11_440, 3_208), (12_090, 3_348)),
+    (2, _FEW): (
+        (1_950, 1_086), (5_070, 1_472), (11_440, 2_308), (12_090, 2_334), (14_960, 2_694),
+        (16_720, 2_900), (18_480, 3_192), (20_240, 3_408), (22_000, 3_552),
+    ),
+    (1, _FEW): (
+        (1_950, 772), (5_070, 1_158), (11_440, 1_994), (12_090, 2_020), (14_960, 2_380),
+        (16_720, 2_586), (18_480, 2_878), (20_240, 3_094), (22_000, 3_238), (23_760, 3_450),
+    ),
+    (2, _FEW_CHUNKED): (
+        (1_950, 1_086), (5_070, 1_252), (11_440, 1_884), (12_090, 1_812), (14_960, 2_050),
+        (16_720, 2_180), (22_000, 2_606), (27_280, 3_012),
+    ),
+    (1, _FEW_CHUNKED): (
+        (1_950, 772), (5_070, 938), (11_440, 1_570), (12_090, 1_498), (14_960, 1_736),
+        (16_720, 1_866), (22_000, 2_292), (27_280, 2_698),
+    ),
 }  # fmt: skip
 """The peak of the transformer stage of Wan 2.2 TI2V-5B by the number of tokens: ``(tokens,
 MiB)`` pairs as measured, fewest tokens first, for every way of running it that was measured:
@@ -127,6 +144,16 @@ One pass holds the time embedding of both branches at once before one row of it 
 which is most of what it adds. Its two largest sizes ran with the VRAM almost full, where the
 allocator gives back what it has cached before it fails: the figure for two slots at 12,090
 tokens is lower than the one below it for that reason, not because it needs less.
+
+**A few steps have rows of their own**, measured with three steps of FastWan through
+:func:`~hypertier.adapters.hf_diffusers.denoise_dmd`. What the allocator reserves follows what
+is allocated and in which order, not only how much, and that loop is another one: one
+timestep per sample, so no time embedding per token, other tensors between two passes, and
+the allocator's cache emptied before every pass. Its peaks are 12 to 146 MiB under the
+guided ones, except at 11,440 tokens, where they are 4 MiB over them with the networks whole
+and 72 MiB in chunks. Read on the guided rows it was wrong by more: at 27,280 tokens in
+chunks it reserved 3,318 MiB with two slots, not 3,158, until the cache was emptied (3,012).
+A peak is of a way of running, and of nothing else.
 """
 
 
@@ -260,12 +287,20 @@ class WanVideoPipeline(SequentialPipeline):
         (:data:`TRANSFORMER_PEAKS`). With fewer tokens than the fewest measured it is the peak
         of those, which it cannot exceed. With more than the most, or run in a way that was
         not measured, nothing is known and nothing is made up: a ``ValueError``.
+
+        A pipeline that samples in a few steps (``dmd_timesteps``) is read on the rows
+        measured that way; it has no guidance, so ``one_pass`` does not count.
         """
         if not self.measured:
             return None
+        few = self.dmd_timesteps is not None
+        one_pass = one_pass and not few  # no guidance, so nothing to run in one pass
         chunked = ffn_chunk is not None and tokens > ffn_chunk
-        way = _ONE_PASS if one_pass else _CHUNKED if chunked else _WHOLE
-        how = _how(slots, one_pass, ffn_chunk if chunked else None)
+        if few:
+            way = _FEW_CHUNKED if chunked else _FEW
+        else:
+            way = _ONE_PASS if one_pass else _CHUNKED if chunked else _WHOLE
+        how = _how(slots, one_pass, ffn_chunk if chunked else None, few)
         points = TRANSFORMER_PEAKS.get((slots, way))
         if points is None or (chunked and (one_pass or ffn_chunk > FFN_CHUNK)):
             raise ValueError(
@@ -357,7 +392,8 @@ class WanVideoPipeline(SequentialPipeline):
                 raise ValueError(f"{not_measured}. {hint}") from None
             if not self.fits(expected, available):
                 chunk = self.ffn_chunk if tokens > (self.ffn_chunk or tokens) else None
-                name = f"transformer ({tokens} tokens, {_how(self.slots, one_pass, chunk)})"
+                how = _how(self.slots, one_pass, chunk, self.dmd_timesteps is not None)
+                name = f"transformer ({tokens} tokens, {how})"
                 raise ValueError(self.shortfall(name, expected, available, hint))
             least = min(c.peak_bytes(num_frames) for c in self._vae_candidates())
             raise ValueError(
@@ -701,9 +737,11 @@ def _is_wan22_ti2v_5b(transformer: dict[str, Any], vae: dict[str, Any]) -> bool:
     )
 
 
-def _how(slots: int, one_pass: bool, ffn_chunk: int | None) -> str:
+def _how(slots: int, one_pass: bool, ffn_chunk: int | None, few: bool = False) -> str:
     """A way of running the transformer, as the messages name it."""
     text = f"{slots} slot" + ("" if slots == 1 else "s")
+    if few:
+        text += ", a few steps without guidance"
     if one_pass:
         text += ", both branches of the guidance in one pass"
     if ffn_chunk is not None:

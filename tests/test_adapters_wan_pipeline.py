@@ -12,7 +12,9 @@ What is checked before a generation (sizes, the VRAM each stage is expected to n
 arithmetic on measured peaks: it is tested with the free VRAM replaced by a number.
 
 With ``HYPERTIER_MODELS`` and ``-m slow``, on Wan 2.2 TI2V-5B: real prompts against
-``WanPipeline``, and the two sizes of the F3 criterion within 3.4 GB of VRAM.
+``WanPipeline``, and the two sizes of the F3 criterion within 3.4 GB of VRAM. With FastWan
+next to it, three steps of the distilled transformer: the main size of the criterion, and
+720p x 121 frames, the longest video the peaks were measured for.
 """
 
 import gc
@@ -288,6 +290,27 @@ def test_the_criterion_sizes_fit_in_the_budget_of_f3(measured):
 
 
 @pytest.mark.cuda
+def test_the_longest_video_fits_the_budget_of_f3_in_a_few_steps_with_one_slot(measured):
+    size = {"height": 704, "width": 1280, "num_frames": 121}  # 27,280 tokens
+    measured.dmd_timesteps = (1000, 757, 522)
+    measured.ffn_chunk = wan.FFN_CHUNK
+    measured.set_available(int(3.4 * GB))
+    with pytest.raises(ValueError) as refused:
+        measured.check(**size)
+    message = str(refused.value)
+    assert "(27280 tokens, 2 slots, a few steps without guidance, the feed-forward" in message
+    assert "slots=1 fits" in message
+    measured.slots = 1
+    peaks = measured.check(**size)
+    assert peaks["vae"] == VAE_CONFIGS[1].peak_bytes(121), "the resident VAE"
+    assert max(peaks.values()) + VRAM_MARGIN <= int(3.4 * GB)
+    # With guidance the same video does not fit: its passes reserve more.
+    measured.dmd_timesteps = None
+    with pytest.raises(ValueError, match="frames fit at 704 x 1280"):
+        measured.check(**size)
+
+
+@pytest.mark.cuda
 def test_a_generation_that_does_not_fit_is_refused_with_what_would(measured):
     tokens = measured.tokens(704, 1280, 49)
     two, one = (measured.transformer_peak(tokens, slots=n) for n in (2, 1))
@@ -318,9 +341,16 @@ def test_a_generation_that_does_not_fit_is_refused_with_what_would(measured):
     measured.slots = 1
     measured.set_available(one + VRAM_MARGIN)
     assert measured.check(**size)["transformer"] == one
-    # A distilled transformer has no guidance to run in one pass: counted as it runs.
+    # A distilled transformer is counted as it runs: on the rows measured in a few steps, and
+    # with no guidance to run in one pass.
     measured.dmd_timesteps = (1000, 757, 522)
-    assert measured.check(**size, one_pass=True)["transformer"] == one
+    few = dict(wan.TRANSFORMER_PEAKS[(1, "few steps")])[tokens] * MiB + CUDA_CONTEXT
+    assert few != one and measured.transformer_peak(tokens, slots=1) == few
+    measured.set_available(few + VRAM_MARGIN)
+    assert measured.check(**size, one_pass=True)["transformer"] == few
+    measured.set_available(few + VRAM_MARGIN - 1)
+    with pytest.raises(ValueError, match=r"\(11440 tokens, 1 slot, a few steps without guidance\)"):
+        measured.check(**size)
 
 
 @pytest.mark.cuda
@@ -329,9 +359,11 @@ def test_the_peak_of_the_transformer_is_read_between_what_was_measured(measured)
         return mib * MiB + CUDA_CONTEXT
 
     for (slots, way), points in wan.TRANSFORMER_PEAKS.items():
-        chunk = wan.FFN_CHUNK if way == "chunked" else None
+        chunk = wan.FFN_CHUNK if way.endswith("chunked") else None
+        few = (1000, 757, 522) if way.startswith("few steps") else None
 
-        def peak(tokens, slots=slots, way=way, chunk=chunk):
+        def peak(tokens, slots=slots, way=way, chunk=chunk, few=few):
+            measured.dmd_timesteps = few
             return measured.transformer_peak(
                 tokens, slots=slots, one_pass=way == "one pass", ffn_chunk=chunk
             )
@@ -347,6 +379,16 @@ def test_the_peak_of_the_transformer_is_read_between_what_was_measured(measured)
         with pytest.raises(ValueError, match=message):
             peak(most + 880)
 
+    assert {way for _, way in wan.TRANSFORMER_PEAKS} == {
+        "whole", "chunked", "one pass", "few steps", "few steps, chunked"
+    }  # fmt: skip
+    measured.dmd_timesteps = (1000, 757, 522)
+    with pytest.raises(ValueError, match="not measured with 3 slots, a few steps without guid"):
+        measured.transformer_peak(12_090, slots=3)
+    in_few = measured.transformer_peak(27_280, slots=1, ffn_chunk=wan.FFN_CHUNK)
+    assert measured.transformer_peak(27_280, slots=1, one_pass=True, ffn_chunk=wan.FFN_CHUNK) == in_few
+    measured.dmd_timesteps = None
+    assert in_few < measured.transformer_peak(27_280, slots=1, ffn_chunk=wan.FFN_CHUNK)
     whole = measured.transformer_peak(12_090, slots=2)
     assert measured.transformer_peak(500, slots=2) == measured.transformer_peak(1_950, slots=2)
     assert measured.transformer_peak(12_090, slots=2, ffn_chunk=wan.FFN_CHUNK) < whole
@@ -588,25 +630,83 @@ def test_the_sizes_of_the_f3_criterion_run_within_3_4_gb(real_dir, height, width
     assert result.stages["transformer"].details["overlap_efficiency_median"] > 0.9
 
 
+FAST = "FastWan2.2-TI2V-5B-FullAttn-Diffusers"
+FAST_STEPS = (1000, 757, 522)
+
+
+@pytest.fixture(scope="module")
+def fast_dir(real_dir):
+    """The transformer of FastWan: distilled from the real model for three steps."""
+    directory = real_dir.parent / FAST / "transformer"
+    if not directory.is_dir():
+        pytest.skip(f"set HYPERTIER_MODELS to a directory that holds {FAST}")
+    return directory
+
+
+def held(report):
+    return (
+        f"{report.seconds:.1f} s, expected {report.expected_peak_bytes / MiB:.0f} MiB, held "
+        f"{report.peak_process_bytes / MiB:.0f} MiB ({report.context_bytes / MiB:.0f} outside the "
+        f"allocator) of {report.budget_bytes / MiB:.0f}"
+    )
+
+
+def the_table_holds(report):
+    """A stage stays under its measured peak, in the allocator's terms and in the driver's."""
+    assert report.peak_reserved_bytes <= report.expected_peak_bytes - CUDA_CONTEXT, report.name
+    assert report.peak_process_bytes <= report.expected_peak_bytes, report.name
+
+
 @pytest.mark.slow
 @pytest.mark.cuda
-def test_the_longest_video_measured_runs_in_what_the_table_says(real_dir):
-    """720p x 121 frames, 27,280 tokens: one slot and the feed-forward networks in chunks."""
+def test_three_steps_of_the_distilled_model_run_within_3_4_gb(real_dir, fast_dir):
+    """The main size of the F3 criterion in three passes instead of a hundred."""
     import torch
 
+    budget = int(3.4 * GB)
+    few = {"transformer": fast_dir, "dmd_timesteps": FAST_STEPS}
+    with load_wan_pipeline(real_dir, **few, vram_budget=budget) as ours:
+        assert ours.measured, "the same transformer as the base model: the same peaks"
+        result = ours(REAL_CASES[0][0], height=704, width=1280, num_frames=49, seed=1024)
+    assert result.frames.shape == (49, 704, 1280, 3) and result.frames.dtype == torch.uint8
+    assert float(result.frames.float().std()) > 10 and result.vae_config == "bf16-resident"
+    assert result.stages["text"].details["prompts"] == 1
+    sampled = result.stages["transformer"].details
+    assert sampled["passes"] == 3 and sampled["overlap_efficiency_median"] > 0.9
+    for name, report in result.stages.items():
+        print(f"\n[fastwan] 704x1280x49 {name}: {held(report)}")
+        assert report.peak_process_bytes <= budget, name
+        the_table_holds(report)
+
+
+@pytest.mark.slow
+@pytest.mark.cuda
+def test_the_longest_video_measured_runs_within_3_4_gb_in_a_few_steps(real_dir, fast_dir):
+    """720p x 121 frames, the size FastWan is distilled at: 27,280 tokens.
+
+    One slot and the feed-forward networks in chunks, under the budget of the F3 criterion:
+    the longest video the peaks were measured for, every stage of it.
+    """
+    import torch
+
+    budget = int(3.4 * GB)
     size = {"height": 704, "width": 1280, "num_frames": 121}
-    with load_wan_pipeline(real_dir, slots=1, ffn_chunk=wan.FFN_CHUNK) as ours:
-        expected = ours.check(**size)["transformer"]
-        embeds = ours.encode([REAL_CASES[0][0]])
-        latents = ours.denoise(embeds, **size, num_inference_steps=1, guidance_scale=1.0)
-        report = ours.reports[-1]
-    assert latents.shape == (1, 48, 31, 44, 80) and bool(torch.isfinite(latents).all())
-    assert report.details["tokens"] == 27_280 and report.details["ffn_chunk"] == wan.FFN_CHUNK
-    measured = dict(wan.TRANSFORMER_PEAKS[(1, "chunked")])[27_280]
-    print(
-        f"\n[pipeline] 27,280 tokens, 1 slot, ffn in chunks: {report.seconds:.1f} s, "
-        f"{report.peak_reserved_bytes / MiB:.0f} MiB reserved (measured {measured}), "
-        f"{report.context_bytes / MiB:.0f} MiB outside the allocator"
-    )
-    assert report.peak_reserved_bytes <= measured * MiB, "the table holds"
-    assert report.peak_process_bytes <= report.expected_peak_bytes == expected
+    few = {"transformer": fast_dir, "dmd_timesteps": FAST_STEPS}
+    with load_wan_pipeline(
+        real_dir, **few, slots=1, ffn_chunk=wan.FFN_CHUNK, vram_budget=budget
+    ) as ours:
+        expected = ours.check(**size)
+        result = ours(REAL_CASES[0][0], **size, seed=1024)
+    assert result.latents.shape == (1, 48, 31, 44, 80) and result.latents.dtype == torch.bfloat16
+    assert result.frames.shape == (121, 704, 1280, 3) and float(result.frames.float().std()) > 10
+    assert result.vae_config == "bf16-resident"
+    sampled = result.stages["transformer"]
+    assert sampled.details["tokens"] == 27_280 and sampled.details["passes"] == 3
+    assert sampled.details["ffn_chunk"] == wan.FFN_CHUNK
+    assert sampled.expected_peak_bytes == expected["transformer"]
+    measured = dict(wan.TRANSFORMER_PEAKS[(1, "few steps, chunked")])[27_280]
+    assert sampled.expected_peak_bytes == measured * MiB + CUDA_CONTEXT
+    for name, report in result.stages.items():
+        print(f"\n[fastwan] 704x1280x121 {name}: {held(report)}")
+        assert report.peak_process_bytes <= budget, name
+        the_table_holds(report)
