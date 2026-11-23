@@ -57,16 +57,16 @@ time_per_pass ≥ max(compute, non_resident_active_bytes / link_bandwidth)
 |---|---|---|
 | F0 | Foundations: CI (CPU + Triton interpreter), hardware bandwidth probe, VRAM tracker | done |
 | F1 | Ping-pong layer streaming + NVMe tier + Hugging Face adapter | done |
-| F2 | TurboQuant KV cache + Triton kernels | third: after F4 |
-| F3 | Video diffusion: sequential pipeline, chunking, VAE tiling (Wan 2.2 TI2V-5B) | first: in progress |
-| F4 | MoE expert cache + planner v0 | second: after F3 |
+| F2 | TurboQuant KV cache + Triton kernels | after F4 |
+| F3 | Video diffusion: sequential pipeline, chunking, VAE tiling (Wan 2.2 TI2V-5B) | done |
+| F4 | MoE expert cache + planner v0 | next |
 | F5 | `pip install hypertier` v0.1.0 with reproducible examples on a 4 GB GPU | last |
 
 The phase numbers are names, not the order. After F1 the order is **F3 → F4 → F2**, then F5:
 
-- **F3 first.** Video diffusion uses no KV cache, and it is where streaming pays most: a
-  denoising step runs thousands of tokens through every block, so the copies hide behind
-  compute.
+- **F3 first, and done.** Video diffusion uses no KV cache, and it is where streaming pays
+  most: a denoising step runs thousands of tokens through every block, so the copies hide
+  behind compute.
 - **F4 next.** The planner decides on which device each block is computed in each phase:
   resident on the GPU, on the CPU, or streamed.
 - **F2 last.** Where the KV cache lives depends on where attention is computed, and that is
@@ -76,8 +76,50 @@ Design documents (architecture, bandwidth model and research survey): **coming s
 
 ## Results so far
 
-F0 and F1 are done. Qwen3-8B in bf16 (15.3 GiB of weights) on the reference laptop (RTX 3050
-Laptop with 4 GB of VRAM, 32 GB of RAM), measured with `benchmarks/bench_llm.py`: two VRAM
+F0, F1 and F3 are done. Everything below was measured on the reference laptop: RTX 3050
+Laptop with 4 GB of VRAM, 32 GB of RAM, NVMe SSD, native Linux.
+
+### Video: 720p with Wan 2.2 on a 4 GB laptop GPU, in about 3 minutes
+
+Wan 2.2 TI2V-5B, text to video, with `benchmarks/bench_video.py`. The text encoder (8.6 GiB),
+the transformer (9.2 GiB in bf16) and the VAE run one at a time, each loaded only while it
+runs. The transformer's blocks are streamed from page-locked RAM through two VRAM slots, and
+the VAE decodes in tiles. Every stage is admitted against a budget of **3.4 GB of VRAM for
+the whole process** before it is loaded.
+
+| | 720p, 49 frames | 480p, 121 frames | 720p, 121 frames |
+|---|---|---|---|
+| **3 steps** with the FastWan transformer | **3.0 min** | **3.0 min** | **7.6 min** |
+| of that: text / transformer / VAE | 4 s / 48 s / 125 s | 4 s / 51 s / 123 s | 4 s / 138 s / 313 s |
+| peak VRAM of the process | 2.94 GB | 3.00 GB | 3.01 GB |
+| **50 guided steps** with the model's own transformer | 23.1 min | 24.7 min | not run |
+| peak VRAM of the process | 2.98 GB | 3.04 GB | |
+| Latents against the baseline | bit for bit | bit for bit | not compared |
+| Tiled decode against the untiled float32 one | 49.3 dB | 49.4 dB | 48.8 dB |
+
+- 704 x 1280 and 480 x 832 px. At 24 frames per second 49 frames are 2 s of video and 121
+  frames are 5 s.
+- The three-step rows use the transformer of FastWan2.2-TI2V-5B-FullAttn (FastVideo,
+  Apache-2.0), distilled from the model for three steps without guidance, in place of the
+  model's own. Weights are never redistributed: you download them yourself.
+- The peak is the most VRAM the process held as the driver counts it, sampled through a
+  whole generation. With two slots, 0.80 GiB of it is transformer weights.
+- The baseline is the transformer of `diffusers` doing the same operations, with a blocking
+  copy of each block right before it runs. With guided steps at a small size (480p, 17
+  frames), where the stock `WanPipeline` fits with offloading, the latents equal its latents
+  bit for bit too.
+- Spatial tiling of the VAE is approximate, and is the only part that is: PSNR of the first
+  9 frames against the untiled float32 decode, which only fits on the CPU. The figures are
+  of the three-step runs; with guided steps both sizes give 49.4 dB.
+- 720p with 121 frames runs with one VRAM slot and the feed-forward networks 2,048 tokens at
+  a time, which is not bit-exact, so its latents are not compared. With all the VRAM the
+  laptop has free instead of the 3.4 GB budget it takes 6.6 min, at 3.34 GB.
+- With three steps the VAE is about 70 % of the time
+  ([#22](https://github.com/vfernandezg-dev/HyperTier/issues/22)).
+
+### Language models
+
+Qwen3-8B in bf16 (15.3 GiB of weights), measured with `benchmarks/bench_llm.py`: two VRAM
 slots, streamed weights in page-locked RAM, each run in its own process.
 
 | | HyperTier, streamed | `accelerate` offloading | CPU only |

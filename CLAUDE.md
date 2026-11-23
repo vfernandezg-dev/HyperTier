@@ -19,41 +19,48 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
 
 ## Status
 
-- Version `0.0.1` (placeholder). **F0 and F1 are done.** F1 landed `stream/pingpong.py`
-  (`LayerStreamer` core, LRU `SlotTable`), `stream/pinned.py` (`PinnedPool`), `io/` (safetensors
-  index, `O_DIRECT` reads), `stream/source.py` (`FileWeights`: RAM tier + NVMe tier),
-  `adapters/hf_transformers.py` (`load_causal_lm`) and `bench_llm`.
-- **Order from here: F3 → F4 → F2**, then F5. Not the numeric order, for these reasons:
-  - F3 (video diffusion) first: it uses no KV cache, and it is where streaming wins most
+- Version `0.0.1` (placeholder). **F0, F1 and F3 are done. The next phase is F4.** F1 landed
+  `stream/pingpong.py` (`LayerStreamer` core, LRU `SlotTable`), `stream/pinned.py`
+  (`PinnedPool`), `io/` (safetensors index, `O_DIRECT` reads), `stream/source.py`
+  (`FileWeights`: RAM tier + NVMe tier), `adapters/hf_transformers.py` (`load_causal_lm`) and
+  `bench_llm`.
+- **Order from here: F4 → F2**, then F5. Not the numeric order, for these reasons:
+  - F3 (video diffusion) went first: it uses no KV cache, and it is where streaming wins most
     clearly: thousands of tokens per step, far above the crossover of ≈ 13 tokens per pass
     (decision 8).
-  - F4 (MoE + planner) next: it decides on which device each block is computed in each phase
-    (resident on the GPU, on the CPU, or streamed).
+  - F4 (MoE expert cache + planner) is next. The planner decides on which device each block
+    is computed in each phase (resident on the GPU, on the CPU, or streamed): the CPU is a
+    compute tier (decision 8), and attention is split between the GPU and the CPU over a KV
+    cache kept in fp16.
   - F2 (KV-cache compression) last: where the KV cache lives depends on where attention is
     computed, and that is what F4 decides.
-- **F3 is in progress.** Landed: dtype conversion while loading (`FileWeights(cast=True)`),
-  the Wan transformer with its sampling loops (`adapters/hf_diffusers.py`: `denoise`, and
+- **F3 landed** dtype conversion while loading (`FileWeights(cast=True)`), the Wan
+  transformer with its sampling loops (`adapters/hf_diffusers.py`: `denoise`, and
   `denoise_dmd` for a transformer distilled for a few steps; `diffusion/chunking.py`), the
   VAE decoded in tiles (`diffusion/tiling.py`, `load_wan_vae`) and the pipeline that runs
   the stages one at a time (`diffusion/sequential.py`, `adapters/wan_pipeline.py`:
-  `load_wan_pipeline`). Exit criterion: 720p x 49 frames, and
-  480p x 121 as the long mode (the model does not guarantee quality at 480p), within 3.4 GB
-  of VRAM. `bench_video` holds a whole generation to it, and both sizes pass. Measured on
-  Wan 2.2 TI2V-5B with 2 slots, 50 guided steps, the GPU going from 60 to 77 °C:
-  720p x 49 in 23.1 min and 480p x 121 in 24.7 min (24.4 and 26.4 s per step, 12.2 and
-  13.2 s per pass; the VAE takes 127 and 123 s in the configuration this laptop gets, bf16
-  resident), with 2.98 and 3.04 GB of VRAM at the peak of the process as the driver counts
-  it and 0.80 GiB of weights in VRAM. Latents equal to the strict baseline bit for bit at
-  both sizes, and to `WanPipeline` at 480p x 17; the tiled decode is 49.4 dB from the
-  untiled float32 one.
-  In three steps without guidance, with the transformer of FastWan 2.2 TI2V-5B
-  (`load_wan_pipeline(transformer=, dmd_timesteps=)`), under the same 3.4 GB: 720p x 49 in
-  180 s and 480p x 121 in 181 s (48 and 51 s in the transformer, 125 and 123 s in the VAE,
-  now 70 % of the time), 2.94 and 3.00 GB at the peak, latents equal to the strict baseline
-  bit for bit, 49.3 and 49.4 dB. 720p x 121, which is outside the criterion, also runs
-  within 3.4 GB, with one slot and the FFN in chunks: 458 s (138 s in the transformer, 313 s
-  in the VAE), 3.01 GB, 48.8 dB; with all the VRAM this laptop has free (two slots, the VAE
-  in bf16 streamed) it takes 395 s and 3.34 GB. Left: the results in the README.
+  `load_wan_pipeline`). Exit criterion: 720p x 49 frames, and 480p x 121 as the long mode
+  (the model does not guarantee quality at 480p), within 3.4 GB of VRAM. `bench_video` holds
+  a whole generation to it. Measured on Wan 2.2 TI2V-5B under that budget, the GPU going
+  from about 60 to 78 °C:
+
+  | | 720p x 49 | 480p x 121 | 720p x 121, outside the criterion |
+  |---|---|---|---|
+  | 50 guided steps, 2 slots | 23.1 min, 2.98 GB | 24.7 min, 3.04 GB | not run |
+  | of it: a pass / the VAE | 12.2 s / 127 s | 13.2 s / 123 s | |
+  | 3 steps of FastWan, no guidance | 180 s, 2.94 GB | 181 s, 3.00 GB | 458 s, 3.01 GB |
+  | of it: transformer / VAE | 48 s / 125 s | 51 s / 123 s | 138 s / 313 s |
+  | slots, FFN, VAE in 3 steps | 2, whole, bf16 resident | 2, whole, bf16 resident | 1, in chunks, bf16 resident |
+  | tiled decode, guided / 3 steps | 49.4 / 49.3 dB | 49.4 / 49.4 dB | - / 48.8 dB |
+
+  GB are the peak of the process as the driver counts it; with 2 slots 0.80 GiB of it are
+  weights. Latents equal to the strict baseline bit for bit at both sizes of the criterion,
+  guided and in three steps, and to `WanPipeline` at 480p x 17; the dB are against the
+  untiled float32 decode. FastWan is `load_wan_pipeline(transformer=, dmd_timesteps=)` with
+  the transformer of FastWan 2.2 TI2V-5B. With all the VRAM this laptop has free, 720p x 121
+  takes 395 s at 3.34 GB (two slots, the VAE in bf16 streamed). Left open, under milestone
+  v0.2: the VAE is about 70 % of a generation in three steps (issue #22), and the guided
+  loop does not empty the allocator's cache between passes (issue #21).
 - F1 exit criterion, measured with `bench_llm` on Qwen3-8B (2 slots, all blocks in RAM): same
   tokens as the strict baseline, 0.77 GB of weights in VRAM, prefill overlap efficiency
   0.90-1.00; 2.28 s/token against 2.88 with `accelerate` offloading, at a third of its peak VRAM.
