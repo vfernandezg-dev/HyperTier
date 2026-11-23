@@ -57,6 +57,45 @@ def test_psnr_of_equal_and_of_different_frames(bench):
     assert bench.psnr(frames + 1, frames) == pytest.approx(48.13, abs=0.01)
 
 
+def _frames(torch, count=5, height=32, width=48):
+    generator = torch.Generator().manual_seed(0)
+    return torch.randint(0, 256, (count, height, width, 3), dtype=torch.uint8, generator=generator)
+
+
+def test_without_the_video_extra_the_video_is_a_webp_and_says_how_to_get_an_mp4(
+    bench, tmp_path, monkeypatch
+):
+    torch = pytest.importorskip("torch")
+    image = pytest.importorskip("PIL.Image")
+    monkeypatch.setattr(bench, "mp4_encoder", lambda: False)
+    written, why = bench.save_video(_frames(torch), tmp_path / "video", fps=24)
+    assert written == tmp_path / "video.webp" and why == bench.MP4_HINT
+    assert "pip install hypertier[video]" in why
+    assert image.open(written).n_frames == 5 and image.open(written).size == (48, 32)
+
+
+def test_with_the_video_extra_the_video_is_an_mp4(bench, tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("imageio_ffmpeg")
+    imageio = pytest.importorskip("imageio.v2")
+    assert bench.mp4_encoder()
+    written, why = bench.save_video(_frames(torch), tmp_path / "video", fps=24)
+    assert written == tmp_path / "video.mp4" and why is None
+    with imageio.get_reader(written) as reader:
+        meta = reader.get_meta_data()
+        assert tuple(meta["size"]) == (48, 32) and meta["fps"] == 24 and meta["codec"] == "h264"
+        assert reader.count_frames() == 5
+
+    def broken(*args, **kwargs):
+        raise OSError("no encoder")
+
+    monkeypatch.setattr(imageio, "get_writer", broken)
+    written, why = bench.save_video(_frames(torch), tmp_path / "again", fps=24)
+    assert written == tmp_path / "again.webp", "the measurement is not lost for its video"
+    assert "could not be written (OSError: no encoder)" in why
+    assert not (tmp_path / "again.mp4").exists()
+
+
 def _stage(seconds, peak, expected=None, **details):
     return {
         "seconds": seconds, "load_seconds": 1.0, "peak_process_bytes": peak * MiB,
@@ -114,9 +153,8 @@ def test_quick_run_end_to_end(bench, disk_tmp, tmp_path, capsys):
     )  # fmt: skip
     assert code == 0, "equal to the strict baseline, and one tile in float32 is the reference"
     (path,) = out_dir.glob("video_*.json")
-    video = path.with_suffix(".webp")
-    if not video.exists():  # with an encoder installed, diffusers writes an mp4 instead
-        video = path.with_suffix(".mp4")
+    mp4 = bench.mp4_encoder()  # the optional extra: hypertier[video]
+    video = path.with_suffix(".mp4" if mp4 else ".webp")
     assert sorted(out_dir.iterdir()) == sorted([path, video]), "the scratch directory is removed"
     assert video.stat().st_size > 1000
     payload = json.loads(path.read_text())
@@ -132,13 +170,18 @@ def test_quick_run_end_to_end(bench, disk_tmp, tmp_path, capsys):
     assert generated["vae_config"] == "fp32-streamed"
     assert generated["stages"]["transformer"]["details"]["passes"] == 6
     assert len(generated["temperature_c"]) == 3
-    assert generated["video"] == {"format": video.suffix[1:], "fps": 24}
-    if video.suffix == ".webp":
+    said = capsys.readouterr().out
+    if mp4:
+        assert generated["video"] == {"format": "mp4", "fps": 24}
+        assert "pip install hypertier[video]" not in said
+    else:
         from PIL import Image
 
+        assert generated["video"] == {"format": "webp", "fps": 24, "not_mp4": bench.MP4_HINT}
+        assert "An animated WebP: for an MP4, pip install hypertier[video]" in said
         assert Image.open(video).n_frames == 9 and Image.open(video).size == (160, 96)
     assert generated["peak_process_bytes"] > generated["stages"]["vae"]["peak_reserved_bytes"]
     assert res["checks"] == {"latents_equal_strict_baseline": True, "psnr_above_threshold": True}
     assert res["psnr"]["frames"] == 5 and res["psnr"]["db"] > 45
     assert res["steps"]["strict"]["steps"] == 2
-    assert "same latents as the strict baseline    yes (2 steps)" in capsys.readouterr().out
+    assert "same latents as the strict baseline    yes (2 steps)" in said
