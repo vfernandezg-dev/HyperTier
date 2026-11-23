@@ -31,14 +31,20 @@ Measured there (`bench_hw`): VRAM free 3.57 GiB, H2D/D2H pinned ≈ 6.7 GB/s, NV
     (resident on the GPU, on the CPU, or streamed).
   - F2 (KV-cache compression) last: where the KV cache lives depends on where attention is
     computed, and that is what F4 decides.
-- **F3 is in progress.** Landed: dtype conversion while loading (`FileWeights(cast=True)`) and
+- **F3 is in progress.** Landed: dtype conversion while loading (`FileWeights(cast=True)`),
   the Wan transformer with its sampling loop (`adapters/hf_diffusers.py`,
-  `diffusion/chunking.py`). Exit criterion: 720p x 49 frames, and 480p x 121 as the long mode
-  (the model does not guarantee quality at 480p). Measured on Wan 2.2 TI2V-5B with 2 slots:
-  latents equal to `WanPipeline` bit for bit, 0.80 GiB of weights in VRAM, 1.8 GiB allocated at
-  the peak and 12.8-13.9 s per pass at about 12,000 tokens, with the GPU at 85 °C.
-  The VAE decodes in tiles (`diffusion/tiling.py`, `load_wan_vae`): a whole video in 124-128 s
-  with 2.75 GiB of VRAM at the peak in the configuration this laptop gets (bf16, resident).
+  `diffusion/chunking.py`), the VAE decoded in tiles (`diffusion/tiling.py`, `load_wan_vae`)
+  and the pipeline that runs the stages one at a time (`diffusion/sequential.py`,
+  `adapters/wan_pipeline.py`: `load_wan_pipeline`). Exit criterion: 720p x 49 frames, and
+  480p x 121 as the long mode (the model does not guarantee quality at 480p), within 3.4 GB
+  of VRAM. `bench_video` holds a whole generation to it, and both sizes pass. Measured on
+  Wan 2.2 TI2V-5B with 2 slots, 50 guided steps, the GPU going from 60 to 77 °C:
+  720p x 49 in 23.1 min and 480p x 121 in 24.7 min (24.4 and 26.4 s per step, 12.2 and
+  13.2 s per pass; the VAE takes 127 and 123 s in the configuration this laptop gets, bf16
+  resident), with 2.98 and 3.04 GB of VRAM at the peak of the process as the driver counts
+  it and 0.80 GiB of weights in VRAM. Latents equal to the strict baseline bit for bit at
+  both sizes, and to `WanPipeline` at 480p x 17; the tiled decode is 49.4 dB from the
+  untiled float32 one. Left: sampling in few steps (FastWan).
 - F1 exit criterion, measured with `bench_llm` on Qwen3-8B (2 slots, all blocks in RAM): same
   tokens as the strict baseline, 0.77 GB of weights in VRAM, prefill overlap efficiency
   0.90-1.00; 2.28 s/token against 2.88 with `accelerate` offloading, at a third of its peak VRAM.
@@ -69,6 +75,7 @@ python benchmarks/bench_hw.py   # hardware profile -> benchmarks/results/hw_*.js
 python benchmarks/bench_streaming.py  # streaming vs resident model -> results/streaming_*.json
 python benchmarks/bench_streaming.py --checkpoint "$HYPERTIER_MODELS/Qwen3-8B"  # real layers
 python benchmarks/bench_llm.py --model "$HYPERTIER_MODELS/Qwen3-8B"  # tokens, VRAM, prefill overlap
+python benchmarks/bench_video.py --model "$HYPERTIER_MODELS/Wan2.2-TI2V-5B-Diffusers"  # F3 criterion
 ruff check .                    # lint (line length 100, target py310)
 python -m build                 # build sdist + wheel
 ```
@@ -159,12 +166,16 @@ Create modules only when the current phase needs them.
    float32 decode on the Wan 2.2 VAE, five prompts at 720p x 49 and 480p x 121. The picture
    decides most of it (15 dB between prompts), then the tile (340 latent cells instead of 256:
    +1.2-2.7 dB), then the dtype (float32 over bf16 with the same tiles: +0.3-0.8 dB). So the
-   VAE has three configurations, best first: bf16 with streamed weights and tiles of 600
-   cells (3,085 MiB at the peak, 106 s per video), bf16 resident with 340 (2,815 MiB,
-   124-128 s), float32 streamed with 256 (2,445 MiB, 293-297 s). `choose_vae_config` takes the
-   first whose measured peak leaves 300 MiB of the VRAM budget, and each has a PSNR
-   threshold: the lowest measured less 1 dB. Tiles go through the public `vae.decode` and are
-   blended in host RAM; `enable_tiling()` of `diffusers` keeps every tile on the GPU.
+   VAE has four configurations, best first (`VAE_CONFIGS`): bf16 with streamed weights and
+   tiles of 600 cells, bf16 resident with 340, bf16 streamed with 256, float32 streamed with
+   256. Each has its measured peak by length of video (17, 49, 121 frames: the length moves
+   it 4 % at most, so it is interpolated between them, and a length outside that range is
+   refused, not extrapolated) and a PSNR threshold, the lowest measured less 1 dB. float32
+   is last: with the same tiles as the small bf16 one it takes twice the time and 950 MiB
+   more for 0.4 dB; it is the route for GPUs without native bf16 (compute capability below
+   8.0, issue #17), where `choose_vae_config` offers nothing else. Tiles go through the
+   public `vae.decode` and are blended in host RAM; `enable_tiling()` of `diffusers` keeps
+   every tile on the GPU.
 6. **Triton first, PyTorch fallback.** Kernels must also run under `TRITON_INTERPRET=1` and be
    tested bit-exact (or within tolerance) against a pure-PyTorch reference.
 7. **Native Linux first.** Development and benchmarks run on native Linux only; WSL2 is no longer
@@ -201,6 +212,20 @@ Create modules only when the current phase needs them.
    copy of a block outlasts its compute, below about 2,000 tokens on the reference laptop
    (at 1,950 they tie: 3.58 s per step against 3.64, with 0.2 GiB more).
 
+10. **A stage is admitted before it is loaded.** A pipeline runs its stages one at a time
+    (`SequentialPipeline`, `load_wan_pipeline`): text encoder, transformer, VAE, each loaded
+    only while it runs. The budget of a stage is the VRAM the driver reports free right before
+    it, once the previous stage is released and the cache emptied, less a margin of 300 MiB;
+    a caller's `vram_budget` can only lower it. What a stage needs comes from peaks measured
+    on the reference laptop, and a generation that does not fit is refused at once with what
+    would (one slot, fewer frames), not minutes later with an out-of-memory error. For Wan
+    2.2 TI2V-5B: text 1.03 GiB; transformer 0.97 GiB plus 135 KB per token with two slots
+    (0.31 GiB less with one); VAE by configuration and length. Like is compared with like:
+    a peak is what PyTorch's allocator reserved in a run of its own plus 143 MiB of CUDA
+    context, and the budget is the VRAM free after `empty_cache()` plus what the process
+    holds. The 3.4 GB of the F3 criterion is a third thing, the peak of the process as the
+    driver counts it, which `bench_video` samples during a whole generation.
+
 ## Coding conventions
 
 - Python ≥ 3.10, type hints on public functions, docstrings explain *why*, not *what*.
@@ -219,6 +244,11 @@ Create modules only when the current phase needs them.
   RAM and allocator state are not shared, and the parent never opens a CUDA context.
 - Report timings in thermal steady state: warm the GPU up first and record its temperature
   with the result. On the reference laptop a pass takes about 6 % longer once the GPU is hot.
+- Run a long benchmark from a `git worktree` of its own, checked out at a commit, with
+  `PYTHONPATH` set to its `src/` (the editable install points at the main checkout) and
+  `--out-dir` pointing back at `benchmarks/results/`. Every measurement is a new process that
+  imports the code on disk at that moment: an edit in the working tree changes or breaks a
+  run in progress.
 - Tests and benchmarks that need real checkpoints read their directory from `HYPERTIER_MODELS`
   (set it in the git-ignored `.env`) and skip without it. Never write that path in the repo.
 - Those tests are marked `slow`, and a plain `pytest` leaves them out. A PR that touches
