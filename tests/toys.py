@@ -201,3 +201,61 @@ def tiny_text_encoder(directory, family="umt5", *, dtype="bfloat16", seed=0):
     torch.manual_seed(seed)
     model_cls(config).to(getattr(torch, dtype)).save_pretrained(directory)
     return directory
+
+
+def tiny_wan_pipeline(directory, *, seed=0):
+    """Write a random tiny Wan 2.2 pipeline as ``WanPipeline.save_pretrained`` does.
+
+    A tokenizer of single characters, a umT5 encoder of width 64 in bfloat16, a transformer
+    of three blocks and a VAE with 16 px per latent cell, both in float32 like the real ones,
+    and the UniPC scheduler. One timestep per token, as Wan 2.2 TI2V. Returns ``directory``.
+    """
+    import diffusers
+    import torch
+    import transformers
+    from tokenizers import Regex, Tokenizer, models, pre_tokenizers, processors
+
+    characters = [chr(code) for code in range(32, 127)]
+    vocab = {"<pad>": 0, "</s>": 1, "<unk>": 2, **{c: i + 3 for i, c in enumerate(characters)}}
+    plain = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
+    plain.pre_tokenizer = pre_tokenizers.Split(Regex("."), "isolated")
+    plain.post_processor = processors.TemplateProcessing(
+        single="$A </s>", special_tokens=[("</s>", 1)]
+    )
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=plain, pad_token="<pad>", eos_token="</s>", unk_token="<unk>"
+    )
+    torch.manual_seed(seed)
+    encoder_config = transformers.UMT5Config(
+        vocab_size=len(vocab), d_model=64, d_kv=16, d_ff=128, num_layers=3, num_heads=4,
+        relative_attention_num_buckets=8, relative_attention_max_distance=16,
+        dropout_rate=0.0, feed_forward_proj="gated-gelu", pad_token_id=0, eos_token_id=1,
+    )  # fmt: skip
+    text_encoder = transformers.UMT5EncoderModel(encoder_config).to(torch.bfloat16)
+    channels = 8
+    transformer = diffusers.WanTransformer3DModel(
+        patch_size=(1, 2, 2), num_attention_heads=2, attention_head_dim=12, in_channels=channels,
+        out_channels=channels, text_dim=64, freq_dim=32, ffn_dim=48, num_layers=3,
+        cross_attn_norm=True, qk_norm="rms_norm_across_heads", rope_max_seq_len=32,
+    )  # fmt: skip
+    with torch.no_grad():
+        for param in transformer.parameters():
+            if not param.any():  # the output projection starts at zero: every output equal
+                param.normal_(0, 0.5)
+    vae = diffusers.AutoencoderKLWan(
+        base_dim=16, decoder_base_dim=16, z_dim=channels, dim_mult=[1, 2, 4, 4],
+        num_res_blocks=1, attn_scales=[], temperal_downsample=[False, True, True],
+        in_channels=12, out_channels=12, patch_size=2, scale_factor_spatial=16,
+        scale_factor_temporal=4, is_residual=True,
+        latents_mean=[0.1 * i for i in range(channels)],
+        latents_std=[1.0 + 0.1 * i for i in range(channels)],
+    )  # fmt: skip
+    scheduler = diffusers.UniPCMultistepScheduler(
+        prediction_type="flow_prediction", use_flow_sigmas=True, flow_shift=5.0
+    )
+    pipeline = diffusers.WanPipeline(
+        tokenizer=tokenizer, text_encoder=text_encoder.eval(), vae=vae.eval(),
+        scheduler=scheduler, transformer=transformer.eval(), expand_timesteps=True,
+    )  # fmt: skip
+    pipeline.save_pretrained(directory)
+    return directory

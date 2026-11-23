@@ -6,5 +6,6 @@ their classes. Each needs an optional extra; importing this package imports none
 """
 
 from hypertier.adapters.hf_transformers import StreamedModel, load_causal_lm, load_text_encoder
+from hypertier.adapters.wan_pipeline import load_wan_pipeline
 
-__all__ = ["StreamedModel", "load_causal_lm", "load_text_encoder"]
+__all__ = ["StreamedModel", "load_causal_lm", "load_text_encoder", "load_wan_pipeline"]
