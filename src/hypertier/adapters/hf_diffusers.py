@@ -38,6 +38,7 @@ hypertier[diffusers]``. Importing this module imports neither PyTorch nor ``diff
 from __future__ import annotations
 
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
@@ -611,16 +612,9 @@ def denoise(
             "one_pass needs a transformer from load_wan_transformer, whose blocks run a batch "
             "one sample at a time: on any other it would be a real batch, with other bits"
         )
+    shape = _latent_video_shape(transformer, latent_shape, latents)
     frames, height, width = latent_shape
     p_t, p_h, p_w = transformer.config.patch_size
-    if min(frames, height, width) < 1 or frames % p_t or height % p_h or width % p_w:
-        raise ValueError(
-            f"a latent of {frames} x {height} x {width} cells does not divide into patches of "
-            f"{p_t} x {p_h} x {p_w}"
-        )
-    shape = (1, transformer.config.in_channels, frames, height, width)
-    if latents is not None and tuple(latents.shape) != shape:
-        raise ValueError(f"latents is {list(latents.shape)}, but latent_shape asks for {list(shape)}")
 
     with torch.no_grad():
         cond = prompt_embeds.to(device=device, dtype=dtype)
@@ -667,7 +661,139 @@ def denoise(
     return latents
 
 
+DMD_SHIFT = 8.0
+"""The shift of the noise schedule that FastVideo distils its few-step Wan models on. It is
+not the ``flow_shift`` of the scheduler that ships with them (5.0), which their sampler does
+not use."""
+
+
+def dmd_sigmas(
+    torch: Any, timesteps: Sequence[int], *, shift: float = DMD_SHIFT, train_timesteps: int = 1000
+) -> torch.Tensor:
+    """The noise level of each timestep of a few-step sampler, in float32, on the CPU.
+
+    The schedule a flow-matching model is trained on has ``train_timesteps`` noise levels
+    ``u = 1, ..., 1 / train_timesteps``, shifted to ``sigma = shift * u / (1 + (shift - 1) *
+    u)``, each with the timestep ``train_timesteps * sigma``. A timestep of the sampler takes
+    the sigma of the nearest timestep of that table. With a shift of 8, the timesteps 1000,
+    757 and 522 are the sigmas 1, 28/37 and 12/23, as float32 arithmetic leaves them.
+    """
+    u = torch.arange(train_timesteps, 0, -1, dtype=torch.float32) / train_timesteps
+    sigmas = shift * u / (1 + (shift - 1) * u)
+    wanted = torch.tensor(list(timesteps), dtype=torch.long)
+    nearest = (sigmas.mul(train_timesteps).unsqueeze(0) - wanted.unsqueeze(1)).abs().argmin(dim=1)
+    return sigmas[nearest]
+
+
+def denoise_dmd(
+    transformer: Any,
+    prompt_embeds: torch.Tensor,
+    *,
+    latent_shape: tuple[int, int, int],
+    timesteps: Sequence[int],
+    shift: float = DMD_SHIFT,
+    generator: torch.Generator | None = None,
+    latents: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sample the latents of one video in a few steps, with a transformer distilled for it.
+
+    The sampler of a model distilled by distribution matching (DMD), such as FastWan: at each
+    of its ``timesteps`` the transformer predicts the velocity, from which the clean video
+    follows, ``x0 = x - sigma * v``; noise is then added back for the next, lower timestep,
+    ``x = (1 - sigma') * x0 + sigma' * noise``, and the last step returns ``x0``. There is no
+    guidance: one pass per step, and no negative prompt.
+
+    ``diffusers`` has no such pipeline for Wan. This follows the sampling loop of FastVideo
+    (``DmdDenoisingStage``, Apache-2.0), which the FastWan checkpoints are made for, in
+    everything that changes the numbers:
+
+    * the sigma of a timestep comes from a schedule with shift 8 (:func:`dmd_sigmas`);
+    * the transformer gets **one timestep per sample**, the nominal one (1000, 757, 522),
+      also for models that otherwise take one per token (``expand_timesteps``);
+    * ``x0`` is computed in float64 and kept in the dtype of the transformer; noise is added
+      in float32;
+    * all noise comes from one generator on the CPU, drawn as ``[1, frames, channels, height,
+      width]``: the initial latents in float32, then one draw per step in the dtype of the
+      transformer. A draw in bfloat16 is not the float32 draw rounded: PyTorch takes other
+      numbers from the generator for it.
+
+    Args:
+        transformer: a ``WanTransformer3DModel`` distilled for these timesteps; the ``model``
+            of :func:`load_wan_transformer`, or any other (a baseline to compare with).
+        prompt_embeds: ``[1, tokens, dim]``, the output of the text encoder for the prompt.
+        latent_shape: ``(frames, height, width)`` of the latent video, in latent cells.
+        timesteps: the timesteps the model was distilled for, highest first.
+        shift: the shift of the schedule those timesteps are read on.
+        generator: source of all the noise, on the CPU. None draws from the global one.
+        latents: initial noise ``[1, channels, frames, height, width]``, instead of drawing it.
+
+    Returns the latents ``[1, channels, frames, height, width]`` on the device and in the
+    dtype of the transformer. Denormalising and decoding them is the VAE's stage.
+
+    Bytes moved per step: every block once.
+    """
+    import torch
+
+    device, dtype = transformer.device, transformer.dtype
+    if prompt_embeds.ndim != 3 or prompt_embeds.shape[0] != 1:
+        raise ValueError(
+            f"prompt_embeds is {list(prompt_embeds.shape)}: this loop samples one video, so it "
+            "takes [1, tokens, dim]"
+        )
+    steps = [int(t) for t in timesteps]
+    if not steps or steps != sorted(set(steps), reverse=True):
+        raise ValueError(f"the timesteps of a few-step sampler go down, and {steps} do not")
+    if generator is not None and generator.device.type != "cpu":
+        raise ValueError(
+            "the noise of this sampler is drawn on the CPU, so that it does not depend on the "
+            f"GPU: the generator is on {generator.device}"
+        )
+    shape = _latent_video_shape(transformer, latent_shape, latents)
+    batch, channels, frames, height, width = shape
+    drawn = (batch, frames, channels, height, width)  # the layout the noise is drawn in
+
+    with torch.no_grad():
+        cond = prompt_embeds.to(device=device, dtype=dtype)
+        sigmas = dmd_sigmas(torch, steps, shift=shift).to(device)
+        if latents is None:
+            x = torch.randn(drawn, generator=generator, dtype=torch.float32).to(device)
+        else:
+            x = latents.to(device=device, dtype=torch.float32).permute(0, 2, 1, 3, 4)
+        for index, t in enumerate(steps):
+            velocity = transformer(
+                hidden_states=x.to(dtype).permute(0, 2, 1, 3, 4),
+                timestep=torch.tensor([t], dtype=torch.long, device=device),
+                encoder_hidden_states=cond,
+                return_dict=False,
+            )[0].permute(0, 2, 1, 3, 4)
+            clean = (x.double() - sigmas[index].double() * velocity.double()).to(velocity.dtype)
+            if index + 1 == len(steps):
+                x = clean
+                break
+            noise = torch.randn(drawn, generator=generator, dtype=clean.dtype).to(device)
+            sigma = sigmas[index + 1].reshape(1, 1, 1, 1, 1)  # a tensor: the sum is in float32
+            x = ((1 - sigma) * clean + sigma * noise).to(noise.dtype)
+    return x.permute(0, 2, 1, 3, 4)
+
+
 # ---------------------------------------------------------------------------------------------
+
+
+def _latent_video_shape(
+    transformer: Any, latent_shape: tuple[int, int, int], latents: torch.Tensor | None
+) -> tuple[int, int, int, int, int]:
+    """``[1, channels, frames, height, width]`` of the latents a loop samples, checked."""
+    frames, height, width = latent_shape
+    p_t, p_h, p_w = transformer.config.patch_size
+    if min(frames, height, width) < 1 or frames % p_t or height % p_h or width % p_w:
+        raise ValueError(
+            f"a latent of {frames} x {height} x {width} cells does not divide into patches of "
+            f"{p_t} x {p_h} x {p_w}"
+        )
+    shape = (1, transformer.config.in_channels, frames, height, width)
+    if latents is not None and tuple(latents.shape) != shape:
+        raise ValueError(f"latents is {list(latents.shape)}, but latent_shape asks for {list(shape)}")
+    return shape
 
 
 def _import_diffusers() -> Any:
@@ -756,6 +882,8 @@ __all__ = [
     "WanVae",
     "choose_vae_config",
     "denoise",
+    "denoise_dmd",
+    "dmd_sigmas",
     "load_wan_transformer",
     "load_wan_vae",
     "usable_vae_configs",
