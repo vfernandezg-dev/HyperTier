@@ -30,12 +30,14 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import inspect
 from itertools import pairwise
 from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from hypertier.adapters import _skeleton as skeleton
+from hypertier.diffusion.chunking import one_sample_at_a_time
 from hypertier.io.safetensors_index import SafetensorsIndex
 from hypertier.stream.pingpong import LayerStreamer, find_blocks
 from hypertier.stream.pinned import ALIGN, align_up
@@ -48,6 +50,9 @@ if TYPE_CHECKING:
 
 MIN_TRANSFORMERS = (5, 24)
 """Oldest ``transformers`` this adapter is tested with; the ``[hf]`` extra pins the same."""
+
+_BATCHED_IN_A_BLOCK = ("hidden_states", "attention_mask", "position_bias")
+"""The arguments of an encoder block that have a row per prompt, in T5 and umT5."""
 
 
 def head_rows(rows: int, row_bytes: int, chunk_bytes: int) -> list[tuple[int, int]]:
@@ -296,9 +301,12 @@ def load_text_encoder(
 
     Bytes moved per call: every encoder block to VRAM once, from disk or from RAM, plus the
     activations of the embedding. The length of the prompts does not change it, and neither
-    does their number, so encoding prompts together costs one pass instead of one each. A
-    batch of another size does not round like a batch of one, though: to reproduce a pipeline
-    that encodes its prompts one by one, do the same.
+    does their number, so encoding prompts together costs one pass instead of one each.
+
+    The prompts of a batch run one at a time inside each block, while its weights are in the
+    slot (:func:`~hypertier.diffusion.one_sample_at_a_time`). A real batch does not round like
+    a batch of one, so this is what gives each prompt the bits it gets alone, which are those
+    of a pipeline that encodes its prompts one by one, as ``diffusers`` does.
 
     Limits:
 
@@ -363,6 +371,18 @@ def load_text_encoder(
         resident_bytes = skeleton.make_resident(torch, model, index, dev, skip, undo)
         weights = FileWeights(index, sources, ram_budget=ram_budget, num_stage=num_stage)
         streamer = LayerStreamer(layers, slots=slots, device=dev, weights=weights)
+        # Whatever computes on activations: the blocks, and the modules with resident weights
+        # (the final norm). T5 hands the position bias of the first block, with the mask of
+        # each prompt in it, on to the others: it is cut per sample like the hidden states.
+        accepted = inspect.signature(layers[0].forward).parameters
+        in_block = [name for name in _BATCHED_IN_A_BLOCK if name in accepted]
+        resident = [
+            module
+            for module in model.modules()
+            if id(module) not in skip and any(p is not None for p in module._parameters.values())
+        ]
+        undo += [one_sample_at_a_time(layer, in_block) for layer in layers]
+        undo += [one_sample_at_a_time(module, (0,)) for module in resident]
         original = type(model)
         model.__class__ = skeleton.on_device_type(original, dev)
         undo.append(functools.partial(setattr, model, "__class__", original))
