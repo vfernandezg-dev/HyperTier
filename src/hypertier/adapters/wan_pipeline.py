@@ -17,6 +17,11 @@ and the sampling loop is :func:`~hypertier.adapters.hf_diffusers.denoise`. The f
 not: the VAE decodes in tiles, which is approximate (see
 :mod:`hypertier.diffusion.tiling`).
 
+A transformer distilled for a few steps (FastWan) takes the place of the pipeline's with
+``transformer=`` and ``dmd_timesteps=``: three passes instead of a hundred, sampled by
+:func:`~hypertier.adapters.hf_diffusers.denoise_dmd`. ``diffusers`` has no pipeline to compare
+that with; it is the loop of FastVideo.
+
 Before anything is loaded, a generation is checked against the VRAM that is free, with the
 peaks measured for Wan 2.2 TI2V-5B: what does not fit is refused with what would, and so is
 what was not measured. Nothing is extrapolated.
@@ -44,6 +49,7 @@ from hypertier.adapters.hf_diffusers import (
     _import_diffusers,
     choose_vae_config,
     denoise,
+    denoise_dmd,
     load_wan_transformer,
     load_wan_vae,
     usable_vae_configs,
@@ -165,6 +171,8 @@ class WanVideoPipeline(SequentialPipeline):
         self,
         model_dir: str | PathLike[str],
         *,
+        transformer: str | PathLike[str] | None = None,
+        dmd_timesteps: Sequence[int] | None = None,
         slots: int = 2,
         ffn_chunk: int | None = None,
         vae_config: VaeConfig | str | None = None,
@@ -175,6 +183,10 @@ class WanVideoPipeline(SequentialPipeline):
         super().__init__(device, vram_budget=vram_budget, margin=margin)
         self._diffusers = _import_diffusers()
         self.root = Path(model_dir)
+        self.transformer_dir = self.root / "transformer" if transformer is None else Path(transformer)
+        self.dmd_timesteps = None if dmd_timesteps is None else tuple(int(t) for t in dmd_timesteps)
+        if self.dmd_timesteps is not None and not self.dmd_timesteps:
+            raise ValueError("dmd_timesteps is empty: a sampler needs at least one step")
         self.slots = slots
         if ffn_chunk is not None and ffn_chunk < 1:
             raise ValueError(f"cannot run {ffn_chunk} tokens at a time")
@@ -192,7 +204,7 @@ class WanVideoPipeline(SequentialPipeline):
                 f"{self.root} samples with two transformers, one after the other; only "
                 "pipelines with one are supported"
             )
-        transformer = _read_json(self.root / "transformer" / "config.json")
+        transformer = _read_json(self.transformer_dir / "config.json")
         vae = _read_json(self.root / "vae" / "config.json")
         self.expand_timesteps = bool(index.get("expand_timesteps", False))
         self.patch_size = tuple(transformer["patch_size"])
@@ -300,6 +312,7 @@ class WanVideoPipeline(SequentialPipeline):
                 "instead of guessed"
             )
         available = self.available()
+        one_pass = one_pass and self.dmd_timesteps is None  # a distilled model has no guidance
 
         def peak(frames: int, slots: int, ffn_chunk: int | None) -> int:
             tokens = self.tokens(height, width, frames)
@@ -431,41 +444,56 @@ class WanVideoPipeline(SequentialPipeline):
         """Sample the latents of one video; returns them on the CPU.
 
         The loop is :func:`~hypertier.adapters.hf_diffusers.denoise` with the scheduler of
-        the pipeline and noise drawn on the CPU from ``seed``.
+        the pipeline and noise drawn on the CPU from ``seed``. With ``dmd_timesteps`` it is
+        :func:`~hypertier.adapters.hf_diffusers.denoise_dmd`: one pass per timestep, and
+        ``negative_prompt_embeds``, ``num_inference_steps``, ``guidance_scale`` and
+        ``one_pass`` are not used.
         """
         torch = self._torch
         shape = self.latent_shape(height, width, num_frames)
         tokens = self.tokens(height, width, num_frames)
-        guided = guidance_scale > 1.0
+        few = self.dmd_timesteps
+        guided = guidance_scale > 1.0 and few is None
         expected = self.transformer_peak(
             tokens, slots=self.slots, one_pass=one_pass and guided, ffn_chunk=self.ffn_chunk
         )
+        generator = torch.Generator("cpu").manual_seed(seed)
         with self.stage("transformer", expected) as report:
             started = time.perf_counter()
             with load_wan_transformer(
-                self.root / "transformer",
+                self.transformer_dir,
                 slots=self.slots,
                 ffn_chunk=self.ffn_chunk,
                 device=self.device,
             ) as streamed:
                 report.load_seconds = time.perf_counter() - started
-                latents = denoise(
-                    streamed.model,
-                    self.scheduler_class.from_pretrained(self.root / "scheduler"),
-                    prompt_embeds,
-                    negative_prompt_embeds,
-                    latent_shape=shape,
-                    expand_timesteps=self.expand_timesteps,
-                    num_inference_steps=num_inference_steps,
-                    guidance_scale=guidance_scale,
-                    generator=torch.Generator("cpu").manual_seed(seed),
-                    one_pass=one_pass and guided,
-                ).cpu()
+                if few is not None:
+                    latents = denoise_dmd(
+                        streamed.model,
+                        prompt_embeds,
+                        latent_shape=shape,
+                        timesteps=few,
+                        generator=generator,
+                    ).cpu()
+                else:
+                    latents = denoise(
+                        streamed.model,
+                        self.scheduler_class.from_pretrained(self.root / "scheduler"),
+                        prompt_embeds,
+                        negative_prompt_embeds,
+                        latent_shape=shape,
+                        expand_timesteps=self.expand_timesteps,
+                        num_inference_steps=num_inference_steps,
+                        guidance_scale=guidance_scale,
+                        generator=generator,
+                        one_pass=one_pass and guided,
+                    ).cpu()
                 report.details.update(
                     tokens=tokens,
                     slots=self.slots,
                     ffn_chunk=self.ffn_chunk,
-                    steps=num_inference_steps,
+                    steps=num_inference_steps if few is None else len(few),
+                    dmd_timesteps=None if few is None else list(few),
                     weights_vram_bytes=streamed.vram_bytes,
                     pinned_ram_bytes=streamed.ram_bytes,
                     **_pass_summary(streamed.streamer.pass_stats()),
@@ -525,13 +553,17 @@ class WanVideoPipeline(SequentialPipeline):
             one_pass: both branches of the guidance in one pass over the weights. Same bits
                 as two passes; it only wins time with few tokens, and costs VRAM.
 
+        A pipeline with ``dmd_timesteps`` samples at those timesteps without guidance:
+        ``negative_prompt``, ``num_inference_steps``, ``guidance_scale`` and ``one_pass`` are
+        not used, and the negative prompt is not encoded.
+
         Bytes moved: the text encoder from disk once; every transformer block from RAM to
         VRAM once per pass, two passes per guided step; the VAE's weights once.
         """
         first = len(self.reports)
         self.latent_shape(height, width, num_frames)  # a size it cannot draw: refused now
         self.check(height=height, width=width, num_frames=num_frames, one_pass=one_pass)
-        guided = guidance_scale > 1.0
+        guided = guidance_scale > 1.0 and self.dmd_timesteps is None
         embeds = self.encode([prompt, negative_prompt] if guided else [prompt])
         latents = self.denoise(
             embeds[:1],
@@ -595,6 +627,8 @@ class WanVideoPipeline(SequentialPipeline):
 def load_wan_pipeline(
     model_dir: str | PathLike[str],
     *,
+    transformer: str | PathLike[str] | None = None,
+    dmd_timesteps: Sequence[int] | None = None,
     slots: int = 2,
     ffn_chunk: int | None = None,
     vae_config: VaeConfig | str | None = None,
@@ -607,6 +641,12 @@ def load_wan_pipeline(
     Args:
         model_dir: a ``diffusers`` pipeline directory (``model_index.json`` and one directory
             per component). Nothing is downloaded, and nothing is loaded yet.
+        transformer: the directory of another transformer to sample with, instead of the
+            pipeline's: a distilled one, which ships without the text encoder and the VAE it
+            shares with its base model.
+        dmd_timesteps: the timesteps of a transformer distilled by distribution matching
+            (1000, 757, 522 for FastWan 2.2 TI2V-5B): the pipeline then samples at those,
+            one pass each, without guidance. None: the scheduler of the pipeline.
         slots: VRAM buffers the transformer's blocks are streamed through.
         ffn_chunk: run the feed-forward network of every transformer block over this many
             tokens at a time: about a third less VRAM per token, for videos that do not fit
@@ -628,6 +668,8 @@ def load_wan_pipeline(
     """
     return WanVideoPipeline(
         model_dir,
+        transformer=transformer,
+        dmd_timesteps=dmd_timesteps,
         slots=slots,
         ffn_chunk=ffn_chunk,
         vae_config=vae_config,

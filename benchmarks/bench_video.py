@@ -29,12 +29,19 @@ is an ``.mp4`` with the optional extra (``pip install hypertier[video]``: ``imag
 ``imageio-ffmpeg``), and otherwise an animated ``.webp``, which Pillow always writes and a
 browser plays. See :func:`save_video` for the license of the ffmpeg that extra brings.
 
+A transformer distilled for a few steps (FastWan) is given with ``--transformer`` and
+``--dmd-timesteps``: the generation then samples at those timesteps, one pass each, without
+guidance, and the strict baseline runs the same loop. With ``--ffn-chunk`` the feed-forward
+networks run in chunks, which is not exact: the latents are then not compared.
+
 Run it from a checkout that nothing edits meanwhile (``git worktree add`` at a commit): every
 measurement is a new process that imports the code as it is on disk at that moment.
 
     python benchmarks/bench_video.py --model "$HYPERTIER_MODELS/Wan2.2-TI2V-5B-Diffusers"
     python benchmarks/bench_video.py --model DIR --height 480 --width 832 --frames 121
     python benchmarks/bench_video.py --model DIR --quick        # 480p x 17 frames, 4 steps
+    python benchmarks/bench_video.py --model DIR --transformer FAST/transformer \\
+        --dmd-timesteps 1000,757,522                            # three steps with FastWan
 """
 
 from __future__ import annotations
@@ -88,6 +95,8 @@ class Config:
     guidance: float = 5.0
     seed: int = 0
     slots: int = 2
+    ffn_chunk: int | None = None
+    dmd_timesteps: tuple[int, ...] | None = None
     prompt: str = PROMPT
     negative: str = NEGATIVE
     vram_budget_gb: float = 3.4
@@ -114,6 +123,10 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--guidance", type=float)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--slots", type=int)
+    parser.add_argument("--ffn-chunk", type=int, help="tokens per chunk of the FFN: not exact")
+    parser.add_argument("--transformer", type=Path, help="another transformer directory")
+    parser.add_argument("--dmd-timesteps", type=_timesteps,
+                        help="timesteps of a distilled transformer, as 1000,757,522")  # fmt: skip
     parser.add_argument("--prompt")
     parser.add_argument("--negative")
     parser.add_argument("--vram-budget-gb", type=float, help="0: whatever is free")
@@ -132,12 +145,20 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return args
 
 
+def _timesteps(text: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in text.split(","))
+
+
 def make_config(args: argparse.Namespace) -> Config:
     values = dict(QUICK) if args.quick else {}
     for field in dataclasses.fields(Config):
         given = getattr(args, field.name)
         if given is not None:
             values[field.name] = given
+    if values.get("dmd_timesteps"):  # the steps of a distilled model are its timesteps
+        if args.steps not in (None, len(values["dmd_timesteps"])):
+            raise SystemExit("--steps is the number of --dmd-timesteps: leave it out")
+        values["steps"] = len(values["dmd_timesteps"])
     cfg = Config(**values)
     if cfg.steps < 1 or cfg.check_steps < 0 or cfg.psnr_frames < 0:
         raise SystemExit("steps must be positive, and the checks cannot be negative")
@@ -237,15 +258,17 @@ def worker_generate(job: dict[str, Any], torch: Any) -> dict[str, Any]:
     idle = job["idle_used_bytes"]
     budget = int(cfg["vram_budget_gb"] * GB) or None
     pipeline = load_wan_pipeline(
-        job["model"], slots=cfg["slots"], vae_config=cfg["vae_config"], vram_budget=budget
-    )
+        job["model"], transformer=job.get("transformer"), dmd_timesteps=cfg["dmd_timesteps"],
+        slots=cfg["slots"], ffn_chunk=cfg["ffn_chunk"], vae_config=cfg["vae_config"],
+        vram_budget=budget,
+    )  # fmt: skip
     warm_up_gpu(cfg["warm_up"], device=pipeline.device)
     size = {"height": cfg["height"], "width": cfg["width"], "num_frames": cfg["frames"]}
     result: dict[str, Any] = {"temperature_c": [_temperature()], "idle_used_bytes": idle}
     result["expected_peaks_bytes"] = pipeline.check(**size)
     started = time.perf_counter()
     with DriverPeak(torch) as peak:
-        guided = cfg["guidance"] > 1.0
+        guided = cfg["guidance"] > 1.0 and not cfg["dmd_timesteps"]
         embeds = pipeline.encode([cfg["prompt"], cfg["negative"]] if guided else [cfg["prompt"]])
         latents = pipeline.denoise(
             embeds[:1], embeds[1:] if guided else None, **size,
@@ -311,31 +334,39 @@ def load_strict(torch: Any, directory: Path) -> Any:
 def worker_steps(job: dict[str, Any], torch: Any) -> dict[str, Any]:
     """The first steps again, streamed or strict, from the embeddings of the generation."""
     from hypertier.adapters import load_wan_pipeline
-    from hypertier.adapters.hf_diffusers import denoise, load_wan_transformer
+    from hypertier.adapters.hf_diffusers import denoise, denoise_dmd, load_wan_transformer
 
     cfg = job["config"]
     root = Path(job["model"])
-    pipeline = load_wan_pipeline(root, slots=cfg["slots"])
+    directory = Path(job["transformer"]) if job.get("transformer") else root / "transformer"
+    pipeline = load_wan_pipeline(root, transformer=directory, slots=cfg["slots"])
     shape = pipeline.latent_shape(cfg["height"], cfg["width"], cfg["frames"])
     embeds = torch.load(job["inputs"])["embeds"]
-    guided = cfg["guidance"] > 1.0
+    few = cfg["dmd_timesteps"]
+    guided = cfg["guidance"] > 1.0 and not few
     started = time.perf_counter()
 
     def sample(model: Any) -> Any:
+        generator = torch.Generator("cpu").manual_seed(cfg["seed"])
+        if few:
+            return denoise_dmd(
+                model, embeds[:1], latent_shape=shape, timesteps=few[: cfg["check_steps"]],
+                generator=generator,
+            ).cpu()  # fmt: skip
         return denoise(
             model, pipeline.scheduler_class.from_pretrained(root / "scheduler"), embeds[:1],
             embeds[1:] if guided else None, latent_shape=shape,
             expand_timesteps=pipeline.expand_timesteps, num_inference_steps=cfg["check_steps"],
-            guidance_scale=cfg["guidance"],
-            generator=torch.Generator("cpu").manual_seed(cfg["seed"]),
+            guidance_scale=cfg["guidance"], generator=generator,
         ).cpu()  # fmt: skip
 
     if job["mode"] == "strict":
-        latents = sample(load_strict(torch, root / "transformer"))
+        latents = sample(load_strict(torch, directory))
     else:
-        with load_wan_transformer(root / "transformer", slots=cfg["slots"]) as streamed:
+        with load_wan_transformer(directory, slots=cfg["slots"]) as streamed:
             latents = sample(streamed.model)
-    result = {"seconds": time.perf_counter() - started, "steps": cfg["check_steps"]}
+    steps = min(cfg["check_steps"], len(few)) if few else cfg["check_steps"]
+    result = {"seconds": time.perf_counter() - started, "steps": steps}
     return {"result": result, "tensors": {"latents": latents}}
 
 
@@ -436,13 +467,20 @@ def psnr(frames: Any, reference: Any) -> float:
     return float("inf") if float(error) == 0 else float(10 * torch.log10(255.0**2 / error))
 
 
-def run(cfg: Config, model: Path, scratch: Path) -> dict[str, Any]:
+def run(
+    cfg: Config, model: Path, scratch: Path, transformer: Path | None = None
+) -> dict[str, Any]:
     import torch
 
     base = {"model": str(model), "config": dataclasses.asdict(cfg)}
+    results: dict[str, Any] = {"model": model.name}
+    if transformer is not None:
+        base["transformer"] = str(transformer)
+        named = transformer.resolve()
+        results["transformer"] = (named.parent if named.name == "transformer" else named).name
     job = {**base, "name": "generate", "mode": "generate", "video": str(scratch / "video")}
     generated, tensors = launch(job, scratch)
-    results: dict[str, Any] = {"model": model.name, "generate": generated, "checks": {}}
+    results.update(generate=generated, checks={})
     if "error" in generated:
         return results
     checks = results["checks"]
@@ -451,7 +489,10 @@ def run(cfg: Config, model: Path, scratch: Path) -> dict[str, Any]:
     if budget and peak is not None:
         checks["within_vram_budget"] = peak <= budget
     inputs = str(scratch / "generate.pt")
-    if cfg.check_steps:
+    sampled = generated["stages"]["transformer"]["details"]
+    # In chunks the feed-forward networks round another way: nothing to be equal to.
+    chunked = cfg.ffn_chunk is not None and sampled["tokens"] > cfg.ffn_chunk
+    if cfg.check_steps and not chunked:
         runs = {}
         for mode in ("streamed", "strict"):
             job = {**base, "name": f"steps_{mode}", "mode": mode, "inputs": inputs}
@@ -484,11 +525,21 @@ def _yes(value: Any) -> str:
 def format_summary(payload: dict[str, Any]) -> str:
     cfg, results = payload["config"], payload["results"]
     generated = results["generate"]
+    few = cfg.get("dmd_timesteps")
+    sampler = (
+        f"{cfg['steps']} steps, guidance {cfg['guidance']:g}"
+        if not few
+        else f"{len(few)} steps at {', '.join(str(t) for t in few)}, no guidance"
+    )
     title = (
         f"bench_video: {cfg['height']} x {cfg['width']} px, {cfg['frames']} frames, "
-        f"{cfg['steps']} steps, guidance {cfg['guidance']:g}, {cfg['slots']} slots"
+        f"{sampler}, {cfg['slots']} slots"
     )
+    if cfg.get("ffn_chunk"):
+        title += f", the FFN {cfg['ffn_chunk']} tokens at a time"
     lines = [title]
+    if results.get("transformer"):
+        lines.append(f"  transformer         {results['transformer']}")
     if "error" in generated:
         return "\n".join([*lines, f"  the generation failed: {generated['error']}"])
     temperature = generated["temperature_c"]
@@ -523,7 +574,8 @@ def format_summary(payload: dict[str, Any]) -> str:
     checks = results["checks"]
     lines.append("criterion:")
     lines.append(f"  within the VRAM budget                 {_yes(checks.get('within_vram_budget'))}")
-    steps = f" ({cfg['check_steps']} steps)" if cfg["check_steps"] else ""
+    compared = results.get("steps", {}).get("strict", {}).get("steps", cfg["check_steps"])
+    steps = f" ({compared} steps)" if cfg["check_steps"] else ""
     same = _yes(checks.get("latents_equal_strict_baseline"))
     lines.append(f"  same latents as the strict baseline    {same}{steps}")
     measured = results.get("psnr")
@@ -556,7 +608,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload: dict[str, Any] = {
             "schema": SCHEMA, "metadata": metadata, "config": dataclasses.asdict(cfg),
         }  # fmt: skip
-        payload["results"] = run(cfg, args.model, scratch)
+        payload["results"] = run(cfg, args.model, scratch, args.transformer)
         path = bench_hw.write_results(payload, args.out_dir, prefix="video")
         video = payload["results"]["generate"].get("video")
         if video is not None:  # next to the results, under the same name
