@@ -425,6 +425,12 @@ class WanVae:
         blended on the CPU: VRAM holds the activations of one tile. Not exact: see
         :mod:`hypertier.diffusion.tiling`.
 
+        The latents are laid out contiguously first. A sampling loop may hand over a
+        permuted view, and a copy to the GPU keeps that layout: every tile then reaches the
+        decoder with its dimensions out of order in memory, which gives the same frames and
+        another sequence of allocations. At 720p x 121 the decode then reserved 166 MiB more
+        with streamed weights and 118 MiB more with resident ones, over the measured peak.
+
         Bytes moved: none with resident weights. With streamed weights every block of the
         decoder goes to VRAM once per latent frame of every tile, because the decoder runs
         frame by frame.
@@ -451,7 +457,8 @@ class WanVae:
                 shape = (1, vae.config.z_dim, 1, 1, 1)
                 mean = torch.tensor(vae.config.latents_mean, dtype=torch.float32).view(shape)
                 std = torch.tensor(vae.config.latents_std, dtype=torch.float32).view(shape)
-                z = latents.to(device="cpu", dtype=torch.float32) / (1.0 / std) + mean
+                z = latents.to(device="cpu", dtype=torch.float32).contiguous()
+                z = z / (1.0 / std) + mean
                 z = z.to(device=self.device, dtype=dtype)
                 rows, columns = plan.tile
                 for i, top in enumerate(plan.rows):
