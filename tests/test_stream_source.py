@@ -217,6 +217,7 @@ class FakeDevice:
         self.copies: list = []
         self.threads: set = set()
         self.fail_read_of = None
+        self.hold = 0.0  # seconds a copy from staging lasts, on top of its random length
         self._rng = rng
         self._pace = pace
 
@@ -250,7 +251,8 @@ class FakeDevice:
         assert self.free_gen[permit.slot] == permit.free_gen, "waited for a stale slot_free"
         if stage is not None:
             assert self.in_stage[stage] == permit.block, "copied the wrong staging buffer"
-            stage_free.done_at = time.perf_counter() + self._rng.random() * self._pace * 4
+            length = self._rng.random() * self._pace * 4 + self.hold
+            stage_free.done_at = time.perf_counter() + length
             self.busy[stage] = stage_free
         self.nap(0.3)
         self.in_slot[permit.slot] = permit.block
@@ -359,10 +361,13 @@ def test_the_block_the_model_waits_for_is_read_before_any_read_ahead():
 def test_a_permit_is_served_while_a_staging_buffer_is_still_in_flight():
     # Blocks 0 and 2 come from disk through a single staging buffer; block 1 is in RAM.
     model = Model(3, 1, 1, [0, 2], start=False, pace=0.0)
+    # A long copy, and long from the moment it is enqueued: an event that is made longer
+    # afterwards may already have been seen done by the reader, which then reads ahead.
+    model.device.hold = 0.4
     model.reader.start()
     model.run_block(0)  # copied from staging: the buffer is in flight from here on
     event = model.device.busy[0]
-    event.done_at = time.perf_counter() + 0.4  # a long copy
+    model.device.hold = 0.0
     t0 = time.perf_counter()
     model.run_block(1)  # RAM tier: must not wait for the staging buffer
     assert time.perf_counter() - t0 < 0.2, "the reader blocked on stage_free"
