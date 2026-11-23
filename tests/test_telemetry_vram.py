@@ -5,7 +5,7 @@
 
 import pytest
 
-from hypertier.telemetry import GiB, MiB
+from hypertier.telemetry import GiB, MiB, vram
 from hypertier.telemetry.vram import VramStats, track_vram
 
 
@@ -69,3 +69,34 @@ def test_track_vram_fills_stats_when_the_block_raises():
         raise KeyError("boom")
     assert tracker.stats.peak_delta >= 32 * MiB
     del y
+
+
+def test_the_vram_of_a_process_is_read_from_the_listing_of_the_driver():
+    listing = "100, GPU-aaaa, 278\n200, GPU-aaaa, 1024\n200, GPU-bbbb, 64\n"
+    assert vram.parse_compute_apps(listing, 100, "GPU-aaaa") == 278 * MiB
+    assert vram.parse_compute_apps(listing, 200, "GPU-bbbb") == 64 * MiB
+    assert vram.parse_compute_apps(listing, 100, None) == 278 * MiB
+    assert vram.parse_compute_apps(listing, 200, None) is None, "on two GPUs: which one?"
+    assert vram.parse_compute_apps(listing, 300, "GPU-aaaa") is None, "not listed"
+    assert vram.parse_compute_apps(listing, 100, "GPU-bbbb") is None
+    assert vram.parse_compute_apps("100, GPU-aaaa, [N/A]\n", 100, "GPU-aaaa") is None  # WSL2
+    assert vram.parse_compute_apps("", 100, None) is None
+    assert vram.parse_compute_apps("No running processes found\n", 100, None) is None
+
+
+@pytest.mark.cuda
+def test_the_vram_of_this_process_is_its_allocator_and_its_context(monkeypatch):
+    import torch
+
+    block = torch.empty(256 * MiB, dtype=torch.uint8, device="cuda")
+    held = vram.process_vram()
+    if held is None:
+        pytest.skip("the driver does not say what this process holds")
+    outside = held - torch.cuda.memory_reserved()
+    assert held >= block.numel() and 40 * MiB < outside < 400 * MiB, "a CUDA context"
+
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("nvidia-smi")
+
+    monkeypatch.setattr(vram.subprocess, "run", missing)
+    assert vram.process_vram() is None

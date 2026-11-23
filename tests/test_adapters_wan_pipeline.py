@@ -144,7 +144,8 @@ def test_every_stage_is_on_record_and_nothing_stays_loaded(diffusers, disk_tmp):
             assert report.expected_peak_bytes is None, "nothing was measured for a tiny model"
             assert 0 < report.load_seconds < report.seconds
             assert 0 < report.peak_allocated_bytes <= report.peak_reserved_bytes
-            assert report.peak_process_bytes == report.peak_reserved_bytes + CUDA_CONTEXT
+            assert report.peak_process_bytes == report.peak_reserved_bytes + report.context_bytes
+            assert 0 < report.context_bytes <= CUDA_CONTEXT
             assert report.budget_bytes >= report.free_before_bytes > 0
         del result, text, transformer, vae, report
         gc.collect()
@@ -536,6 +537,9 @@ def test_the_sizes_of_the_f3_criterion_run_within_3_4_gb(real_dir, height, width
         assert report.budget_bytes <= budget
         assert report.peak_process_bytes <= budget, name
         assert report.peak_process_bytes <= report.expected_peak_bytes, "the table holds"
+        if report.context_measured:
+            print(f"[pipeline] {name}: {report.context_bytes / MiB:.0f} MiB outside the allocator")
+            assert report.context_bytes <= CUDA_CONTEXT, "no context above the most measured"
     assert result.stages["transformer"].details["overlap_efficiency_median"] > 0.9
 
 
@@ -556,7 +560,8 @@ def test_the_longest_video_measured_runs_in_what_the_table_says(real_dir):
     measured = dict(wan.TRANSFORMER_PEAKS[(1, "chunked")])[27_280]
     print(
         f"\n[pipeline] 27,280 tokens, 1 slot, ffn in chunks: {report.seconds:.1f} s, "
-        f"{report.peak_reserved_bytes / MiB:.0f} MiB reserved (measured {measured})"
+        f"{report.peak_reserved_bytes / MiB:.0f} MiB reserved (measured {measured}), "
+        f"{report.context_bytes / MiB:.0f} MiB outside the allocator"
     )
     assert report.peak_reserved_bytes <= measured * MiB, "the table holds"
     assert report.peak_process_bytes <= report.expected_peak_bytes == expected

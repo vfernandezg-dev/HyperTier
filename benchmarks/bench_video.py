@@ -9,8 +9,9 @@ a process of its own:
 
 * **It fits.** The generation runs under ``--vram-budget-gb`` (3.4 by default, the budget of
   the criterion), and the VRAM the process holds is sampled from the driver all the way
-  through: the peak has to stay under that budget. Per stage: time, the peaks of the
-  allocator, and for the transformer how well the copies hid behind compute.
+  through: the peak has to stay under that budget. Per stage: time, the peak of the process
+  (what the allocator reserved plus what the driver counts outside it), and for the
+  transformer how well the copies hid behind compute.
 * **The same latents.** The first ``--check-steps`` steps are sampled twice more from the
   same text embeddings: by the streamed transformer, and by a *strict baseline*, the
   transformer as ``diffusers`` loads it with every block copied to the GPU, blocking, right
@@ -498,9 +499,11 @@ def format_summary(payload: dict[str, Any]) -> str:
     for name, stage in generated["stages"].items():
         expected = stage["expected_peak_bytes"]
         promise = "" if expected is None else f" (expected {expected / MiB:.0f})"
+        context = stage.get("context_bytes") if stage.get("context_measured") else None
+        outside = "" if context is None else f", {context / MiB:.0f} outside the allocator"
         lines.append(
             f"  {name:<19} {stage['seconds']:8.1f} s   load {stage['load_seconds']:5.1f} s   "
-            f"peak {stage['peak_process_bytes'] / MiB:5.0f} MiB{promise}"
+            f"peak {stage['peak_process_bytes'] / MiB:5.0f} MiB{promise}{outside}"
         )
     passes = generated["stages"].get("transformer", {}).get("details", {})
     if passes.get("passes"):

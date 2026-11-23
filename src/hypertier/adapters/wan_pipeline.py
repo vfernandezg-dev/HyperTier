@@ -72,7 +72,8 @@ every call, and a prompt sampled again with another seed need not be encoded aga
 
 TEXT_PEAK = 912 * MiB + CUDA_CONTEXT
 """VRAM the process holds at the peak of the text stage: umT5-XXL through two slots, two
-prompts of 512 tokens (880 MiB of allocator for one prompt)."""
+prompts of 512 tokens (880 MiB of allocator for one prompt), and what a process holds outside
+the allocator."""
 
 FFN_CHUNK = 2048
 """Tokens the feed-forward networks ran over at a time in the peaks measured "in chunks".
@@ -405,6 +406,7 @@ class WanVideoPipeline(SequentialPipeline):
                             batch.input_ids.to(self.device), batch.attention_mask.to(self.device)
                         ).last_hidden_state.cpu()
                     report.details.update(prompts=len(missing), tokens=used)
+                    self.read_context(report)
             for row, (key, length) in enumerate(zip(missing, used)):
                 embedding = hidden[row].clone()
                 embedding[length:] = 0  # as WanPipeline: the tokens of the prompt, then zeros
@@ -468,6 +470,7 @@ class WanVideoPipeline(SequentialPipeline):
                     pinned_ram_bytes=streamed.ram_bytes,
                     **_pass_summary(streamed.streamer.pass_stats()),
                 )
+                self.read_context(report)  # with the page-locked RAM still registered
         return latents
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
@@ -493,6 +496,7 @@ class WanVideoPipeline(SequentialPipeline):
                     weights_vram_bytes=vae.vram_bytes,
                     pinned_ram_bytes=vae.ram_bytes,
                 )
+                self.read_context(report)
         return frames
 
     def __call__(

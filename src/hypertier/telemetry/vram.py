@@ -12,12 +12,14 @@ streaming slots are judged by the first.
 
 from __future__ import annotations
 
+import os
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from hypertier.telemetry._common import format_bytes, require_cuda, resolve_device
+from hypertier.telemetry._common import MiB, format_bytes, require_cuda, resolve_device
 
 
 @dataclass
@@ -117,3 +119,45 @@ def track_vram(
         except RuntimeError:
             if not failed:  # a broken CUDA context must not hide the block's own error
                 raise
+
+
+def process_vram(device: Any = None) -> int | None:
+    """VRAM the driver attributes to this process on ``device``, in bytes; None if unknown.
+
+    Everything the process holds: PyTorch's allocator, and what no counter of PyTorch shows,
+    which is the CUDA context, the kernels loaded into it as they are first used, and the
+    driver's bookkeeping for page-locked RAM. Read through ``nvidia-smi``, which needs no
+    dependency (about 20 ms). None when it is missing or fails, when the driver keeps no
+    figure per process (WSL2), and when this process is not in its list, as in a container
+    with process IDs of its own.
+    """
+    torch = require_cuda()
+    dev = resolve_device(device)
+    command = ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid,used_memory",
+               "--format=csv,noheader,nounits"]  # fmt: skip
+    try:
+        done = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    uuid = getattr(torch.cuda.get_device_properties(dev), "uuid", None)
+    return parse_compute_apps(done.stdout, os.getpid(), None if uuid is None else f"GPU-{uuid}")
+
+
+def parse_compute_apps(listing: str, pid: int, gpu_uuid: str | None) -> int | None:
+    """Bytes of ``pid`` on the GPU ``gpu_uuid`` in a ``pid, gpu_uuid, MiB`` listing, or None.
+
+    Without a UUID the process has to be listed once: on two GPUs it is not known which.
+    """
+    found = []
+    for line in listing.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 3 or fields[0] != str(pid):
+            continue
+        if gpu_uuid is not None and fields[1] != gpu_uuid:
+            continue
+        if not fields[2].isdigit():  # "[N/A]": the driver does not say
+            return None
+        found.append(int(fields[2]) * MiB)
+    return found[0] if len(found) == 1 else None
