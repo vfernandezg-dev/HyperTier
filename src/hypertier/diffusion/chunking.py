@@ -8,7 +8,8 @@ work, and the two ways to split are not equally exact:
 
 * :func:`one_sample_at_a_time` runs a batch as one call per sample. Every call has the shapes
   of a batch of one, so it picks the kernels of a batch of one and gives its bits: a batch
-  run this way **equals** one pass per sample, bit for bit.
+  run this way **equals** one pass per sample, bit for bit. Say which arguments carry the
+  batch: guessing them from their shapes can cut a tensor the batch shares.
 * :func:`chunk_tokens` runs a per-token module over ranges of tokens. Other shapes pick other
   kernels, so the values are the same **up to rounding** (1 ulp of bfloat16 measured). A
   sampler amplifies that over its steps: judge it by the error of one pass, never by the
@@ -24,37 +25,57 @@ Importing this module does not import PyTorch.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
+import inspect
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 _MARK = "one_sample_at_a_time"
 
 
-def one_sample_at_a_time(module: Any) -> Callable[[], None]:
+def one_sample_at_a_time(
+    module: Any, batched: Iterable[int | str] | None = None
+) -> Callable[[], None]:
     """Make ``module`` run a batch as one call per sample; returns what undoes it.
 
-    The batch is the first dimension of the first tensor the module is called with. Every
-    tensor argument with that first dimension is cut, also inside tuples and lists; anything
-    else (a table shared by the batch, a flag) is passed whole to every call. Outputs are
-    tensors, or tuples and lists of them, that keep the batch dimension: they are joined along
-    it. A batch of one is passed through untouched.
+    Args:
+        module: the instance whose ``forward`` is replaced.
+        batched: the arguments of ``forward`` that carry the batch, each by position or by
+            name; either way of naming an argument covers both ways of passing it. Only these
+            are cut, also inside tuples and lists; every other argument is passed whole to
+            every call. One of them with a first dimension of 1 is passed whole too, since it
+            broadcasts; any other first dimension than the batch is an error. Say it whenever
+            the signature is known: it is what an adapter does.
+
+    Without ``batched`` the batch is guessed: it is the first dimension of the first tensor
+    the module is called with, and every tensor argument with that first dimension is cut.
+    A table shared by the batch that happens to have as many rows as the batch has samples
+    is then cut as well, **without notice**, and every sample computes with one row of it.
+
+    Outputs are tensors, or tuples and lists of them, that keep the batch dimension: they are
+    joined along it. A batch of one is passed through untouched.
 
     Bytes moved per pass: unchanged. This is what lets one pass over the weights serve
     several samples (both branches of classifier-free guidance, two prompts) with the
     activations of one.
     """
     inner = module.forward
+    declared = None if batched is None else _Batched(module, inner, batched)
 
     def forward(*args: Any, **kwargs: Any) -> Any:
-        size = _batch_size((*args, *kwargs.values()))
+        if declared is None:
+            size = _batch_size((*args, *kwargs.values()))
+        else:
+            size = declared.batch_size(args, kwargs)
         if size is None or size <= 1:
             return inner(*args, **kwargs)
         joined = piece = None
         for number in range(size):
-            piece = inner(
-                *_sample(args, number, size),
-                **{key: _sample(value, number, size) for key, value in kwargs.items()},
-            )
+            if declared is None:
+                some = _sample(args, number, size)
+                named = {key: _sample(value, number, size) for key, value in kwargs.items()}
+            else:
+                some, named = declared.sample(args, kwargs, number, size)
+            piece = inner(*some, **named)
             if joined is None:
                 joined = _allocate(piece, size, module)
             _store(joined, piece, number)
@@ -119,6 +140,83 @@ def _restore_forward(module: Any, forward: Any, previous: Any, done: list[bool])
     else:
         module.forward = previous
     done.append(True)
+
+
+class _Batched:
+    """Which arguments of a ``forward`` carry the batch, by position and by name."""
+
+    def __init__(self, module: Any, inner: Any, declared: Iterable[int | str]) -> None:
+        self._owner = type(module).__name__
+        parameters = list(inspect.signature(inner).parameters.values())
+        kinds = inspect.Parameter
+        ordered = [
+            p.name
+            for p in parameters
+            if p.kind in (kinds.POSITIONAL_ONLY, kinds.POSITIONAL_OR_KEYWORD)
+        ]
+        named = {p.name for p in parameters if p.kind is kinds.KEYWORD_ONLY}
+        any_position = any(p.kind is kinds.VAR_POSITIONAL for p in parameters)
+        any_name = any(p.kind is kinds.VAR_KEYWORD for p in parameters)
+        self._positions: set[int] = set()
+        self._names: set[str] = set()
+        for item in declared:
+            if isinstance(item, str):
+                if item in ordered:
+                    self._positions.add(ordered.index(item))
+                elif item not in named and not any_name:
+                    raise ValueError(f"the forward of {self._owner} has no argument {item!r}")
+                self._names.add(item)
+            elif 0 <= item < len(ordered):
+                self._positions.add(item)
+                self._names.add(ordered[item])
+            elif item >= 0 and any_position:
+                self._positions.add(item)
+            else:
+                raise ValueError(f"the forward of {self._owner} has no argument at {item}")
+        if not self._positions and not self._names:
+            raise ValueError(f"no argument of {self._owner} was said to carry the batch")
+
+    def batch_size(self, args: Any, kwargs: Any) -> int | None:
+        """The largest first dimension among the batched arguments: one of 1 broadcasts."""
+        chosen = [args[i] for i in self._positions if i < len(args)]
+        chosen += [value for key, value in kwargs.items() if key in self._names]
+        sizes = list(_first_dimensions(chosen))
+        return max(sizes) if sizes else None
+
+    def sample(self, args: Any, kwargs: Any, number: int, size: int) -> tuple[Any, Any]:
+        some = tuple(
+            self._cut(value, number, size, f"argument {i}") if i in self._positions else value
+            for i, value in enumerate(args)
+        )
+        named = {
+            key: self._cut(value, number, size, repr(key)) if key in self._names else value
+            for key, value in kwargs.items()
+        }
+        return some, named
+
+    def _cut(self, value: Any, number: int, size: int, which: str) -> Any:
+        if _is_tensor(value):
+            rows = int(value.shape[0]) if value.ndim else None
+            if rows == size:
+                return value[number : number + 1]
+            if rows == 1:
+                return value
+            raise ValueError(
+                f"{which} of {self._owner} is said to carry the batch, but it is "
+                f"{list(value.shape)} in a batch of {size}"
+            )
+        if type(value) in (tuple, list):
+            return type(value)(self._cut(item, number, size, which) for item in value)
+        return value
+
+
+def _first_dimensions(values: Any) -> Iterator[int]:
+    for value in values:
+        if _is_tensor(value):
+            if value.ndim:
+                yield int(value.shape[0])
+        elif type(value) in (tuple, list):
+            yield from _first_dimensions(value)
 
 
 def _is_tensor(value: Any) -> bool:

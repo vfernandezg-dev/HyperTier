@@ -147,17 +147,24 @@ def load_wan_transformer(
 
         # Everything that computes on activations, so that a batch gives the bits of its
         # samples run alone. What is left in the model's forward is elementwise or a reshape.
+        # The arguments that carry the batch are named: the rotary table of a block is shared.
+        first = (0,)
+        in_block = ("hidden_states", "encoder_hidden_states", "temb")
         per_sample = [
-            model.patch_embedding,
-            embedder.time_embedder,
-            embedder.time_proj,
-            embedder.text_embedder,
-            getattr(embedder, "image_embedder", None),
-            *blocks,
-            model.norm_out,
-            model.proj_out,
+            (model.patch_embedding, first),
+            (embedder.time_embedder, first),
+            (embedder.time_proj, first),
+            (embedder.text_embedder, first),
+            (getattr(embedder, "image_embedder", None), first),
+            *[(block, in_block) for block in blocks],
+            (model.norm_out, first),
+            (model.proj_out, first),
         ]
-        undo += [one_sample_at_a_time(module) for module in per_sample if module is not None]
+        undo += [
+            one_sample_at_a_time(module, batched)
+            for module, batched in per_sample
+            if module is not None
+        ]
         if ffn_chunk is not None:
             undo += [chunk_tokens(block.ffn, ffn_chunk) for block in blocks]
     except BaseException:
